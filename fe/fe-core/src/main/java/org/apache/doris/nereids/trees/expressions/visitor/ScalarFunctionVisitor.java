@@ -424,12 +424,14 @@ import org.apache.doris.nereids.trees.expressions.functions.scalar.ToIpv6OrNull;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.ToMonday;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.ToQuantileState;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Tokenize;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.Translate;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Trim;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Truncate;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Unhex;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.UnixTimestamp;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Upper;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.UrlDecode;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.UrlEncode;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.User;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.UtcTimestamp;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Uuid;
@@ -1647,6 +1649,10 @@ public interface ScalarFunctionVisitor<R, C> {
         return visitScalarFunction(urlDecode, context);
     }
 
+    default R visitUrlEncode(UrlEncode urlEncode, C context) {
+        return visitScalarFunction(urlEncode, context);
+    }
+
     default R visitRandomBytes(RandomBytes randomBytes, C context) {
         return visitScalarFunction(randomBytes, context);
     }
@@ -2041,6 +2047,10 @@ public interface ScalarFunctionVisitor<R, C> {
 
     default R visitToQuantileState(ToQuantileState toQuantileState, C context) {
         return visitScalarFunction(toQuantileState, context);
+    }
+
+    default R visitTranslate(Translate translate, C context) {
+        return visitScalarFunction(translate, context);
     }
 
     default R visitTrim(Trim trim, C context) {
