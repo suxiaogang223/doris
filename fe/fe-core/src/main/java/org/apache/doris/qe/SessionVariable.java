@@ -466,6 +466,12 @@ public class SessionVariable implements Serializable, Writable {
 
     public static final String ENABLE_SCAN_RUN_SERIAL = "enable_scan_node_run_serial";
 
+    public static final String ICEBERG_SPLIT_MULTIPLIER = "iceberg_split_multiplier";
+
+    public static final String ICEBERG_SPLIT_PARALLEL_ENABLED = "iceberg_split_parallel_enabled";
+
+    public static final String ICEBERG_SPLIT_PARALLEL_THREADS = "iceberg_split_parallel_threads";
+
     public static final String ENABLE_ANALYZE_COMPLEX_TYPE_COLUMN = "enable_analyze_complex_type_column";
 
     public static final String EXTERNAL_TABLE_ANALYZE_PART_NUM = "external_table_analyze_part_num";
@@ -998,6 +1004,24 @@ public class SessionVariable implements Serializable, Writable {
             "Whether to enable ScanNode serial reading to avoid read amplification in cases of small limits"
                 + "which can improve query concurrency. default is false."})
     public boolean enableScanRunSerial = false;
+
+    @VariableMgr.VarAttr(name = ICEBERG_SPLIT_MULTIPLIER, description = {
+            "用于测试的变量，控制Iceberg表split数量的倍数，用于模拟大量split的内存测试场景",
+            "Variable for testing purposes, controls the multiplier of Iceberg split count for simulating "
+                + "memory testing scenarios with large number of splits. Default is 1."})
+    public int icebergSplitMultiplier = 1;
+
+    @VariableMgr.VarAttr(name = ICEBERG_SPLIT_PARALLEL_ENABLED, description = {
+            "是否启用Iceberg split的并行处理，可以显著提高大量split场景下的性能",
+            "Whether to enable parallel processing of Iceberg splits, which can significantly improve "
+                + "performance in scenarios with large number of splits. Default is false."})
+    public boolean icebergSplitParallelEnabled = false;
+
+    @VariableMgr.VarAttr(name = ICEBERG_SPLIT_PARALLEL_THREADS, description = {
+            "Iceberg split并行处理的线程数，仅在启用并行处理时生效",
+            "Number of threads for parallel processing of Iceberg splits, only effective when "
+                + "parallel processing is enabled. Default is 4."})
+    public int icebergSplitParallelThreads = 4;
 
     @VariableMgr.VarAttr(name = ENABLE_SQL_CACHE, fuzzy = true)
     public boolean enableSqlCache = false;
@@ -3055,6 +3079,18 @@ public class SessionVariable implements Serializable, Writable {
 
     public boolean isEnableScanRunSerial() {
         return enableScanRunSerial;
+    }
+
+    public int getIcebergSplitMultiplier() {
+        return icebergSplitMultiplier;
+    }
+
+    public boolean isIcebergSplitParallelEnabled() {
+        return icebergSplitParallelEnabled;
+    }
+
+    public int getIcebergSplitParallelThreads() {
+        return icebergSplitParallelThreads;
     }
 
     public boolean skipStorageEngineMerge() {

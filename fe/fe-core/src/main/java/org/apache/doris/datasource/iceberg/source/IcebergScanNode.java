@@ -77,6 +77,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public class IcebergScanNode extends FileQueryScanNode {
 
@@ -255,31 +260,21 @@ public class IcebergScanNode extends FileQueryScanNode {
         }
         try (CloseableIterable<CombinedScanTask> combinedScanTasks =
                      TableScanUtil.planTasks(fileScanTasks, realFileSplitSize, 1, 0)) {
-            combinedScanTasks.forEach(taskGrp -> taskGrp.files().forEach(splitTask -> {
-                if (isPartitionedTable) {
-                    StructLike structLike = splitTask.file().partition();
-                    // Counts the number of partitions read
-                    partitionPathSet.add(structLike.toString());
-                }
-                String originalPath = splitTask.file().path().toString();
-                LocationPath locationPath = new LocationPath(originalPath, source.getCatalog().getProperties());
-                IcebergSplit split = new IcebergSplit(
-                        locationPath,
-                        splitTask.start(),
-                        splitTask.length(),
-                        splitTask.file().fileSizeInBytes(),
-                        new String[0],
-                        formatVersion,
-                        source.getCatalog().getProperties(),
-                        new ArrayList<>(),
-                        originalPath);
-                split.setTargetSplitSize(realFileSplitSize);
-                if (formatVersion >= MIN_DELETE_FILE_SUPPORT_VERSION) {
-                    split.setDeleteFileFilters(getDeleteFileFilters(splitTask));
-                }
-                split.setTableFormatType(TableFormatType.ICEBERG);
-                splits.add(split);
-            }));
+            
+            // 使用系统变量控制split数量倍数和并行处理，用于性能优化和内存测试
+            int splitMultiplier = sessionVariable.getIcebergSplitMultiplier();
+            boolean parallelEnabled = sessionVariable.isIcebergSplitParallelEnabled();
+            int parallelThreads = sessionVariable.getIcebergSplitParallelThreads();
+            
+            if (parallelEnabled && splitMultiplier > 1) {
+                // 并行处理大量split的场景
+                processTasksInParallel(combinedScanTasks, splits, splitMultiplier, parallelThreads,
+                        isPartitionedTable, partitionPathSet, formatVersion, realFileSplitSize);
+            } else {
+                // 单线程处理（原有逻辑）
+                processTasksSequentially(combinedScanTasks, splits, splitMultiplier,
+                        isPartitionedTable, partitionPathSet, formatVersion, realFileSplitSize);
+            }
         } catch (IOException e) {
             throw new UserException(e.getMessage(), e.getCause());
         }
@@ -459,5 +454,134 @@ public class IcebergScanNode extends FileQueryScanNode {
             ((IcebergSplit) splits.get(i)).setTableLevelRowCount(countPerSplit);
         }
         ((IcebergSplit) splits.get(size - 1)).setTableLevelRowCount(countPerSplit + totalCount % size);
+    }
+
+    /**
+     * 并行处理Iceberg scan tasks，用于大量split场景的性能优化
+     */
+    private void processTasksInParallel(CloseableIterable<CombinedScanTask> combinedScanTasks,
+                                      List<Split> splits,
+                                      int splitMultiplier,
+                                      int parallelThreads,
+                                      boolean isPartitionedTable,
+                                      HashSet<String> partitionPathSet,
+                                      int formatVersion,
+                                      long realFileSplitSize) throws UserException {
+        
+        // 使用线程安全的集合
+        List<Split> threadSafeSplits = Collections.synchronizedList(splits);
+        ConcurrentHashMap<String, Boolean> concurrentPartitionPathSet = new ConcurrentHashMap<>();
+        
+        // 收集所有tasks到列表中
+        List<CombinedScanTask> taskList = new ArrayList<>();
+        combinedScanTasks.forEach(taskList::add);
+        
+        ExecutorService executor = Executors.newFixedThreadPool(parallelThreads);
+        
+        try {
+            // 为每个splitMultiplier创建并行任务
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            
+            for (int multiplier = 0; multiplier < splitMultiplier; multiplier++) {
+                CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
+                    taskList.parallelStream().forEach(taskGrp -> {
+                        taskGrp.files().forEach(splitTask -> {
+                            try {
+                                if (isPartitionedTable) {
+                                    StructLike structLike = splitTask.file().partition();
+                                    // Counts the number of partitions read (thread-safe)
+                                    concurrentPartitionPathSet.put(structLike.toString(), true);
+                                }
+                                String originalPath = splitTask.file().path().toString();
+                                LocationPath locationPath = new LocationPath(originalPath, 
+                                    source.getCatalog().getProperties());
+                                IcebergSplit split = new IcebergSplit(
+                                        locationPath,
+                                        splitTask.start(),
+                                        splitTask.length(),
+                                        splitTask.file().fileSizeInBytes(),
+                                        new String[0],
+                                        formatVersion,
+                                        source.getCatalog().getProperties(),
+                                        new ArrayList<>(),
+                                        originalPath);
+                                split.setTargetSplitSize(realFileSplitSize);
+                                if (formatVersion >= MIN_DELETE_FILE_SUPPORT_VERSION) {
+                                    split.setDeleteFileFilters(getDeleteFileFilters(splitTask));
+                                }
+                                split.setTableFormatType(TableFormatType.ICEBERG);
+                                threadSafeSplits.add(split);
+                            } catch (Exception e) {
+                                LOG.error("Error processing split task in parallel", e);
+                                throw new RuntimeException(e);
+                            }
+                        });
+                    });
+                }, executor);
+                
+                futures.add(future);
+            }
+            
+            // 等待所有任务完成
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
+            
+            // 将并发集合的结果同步回原集合
+            partitionPathSet.addAll(concurrentPartitionPathSet.keySet());
+            
+        } catch (Exception e) {
+            LOG.error("Error in parallel processing of iceberg splits", e);
+            throw new UserException("Failed to process iceberg splits in parallel: " + e.getMessage());
+        } finally {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * 串行处理Iceberg scan tasks（原有逻辑）
+     */
+    private void processTasksSequentially(CloseableIterable<CombinedScanTask> combinedScanTasks,
+                                        List<Split> splits,
+                                        int splitMultiplier,
+                                        boolean isPartitionedTable,
+                                        HashSet<String> partitionPathSet,
+                                        int formatVersion,
+                                        long realFileSplitSize) {
+        
+        int remainingMultiplier = splitMultiplier;
+        while (remainingMultiplier-- > 0) {
+            combinedScanTasks.forEach(taskGrp -> taskGrp.files().forEach(splitTask -> {
+                if (isPartitionedTable) {
+                    StructLike structLike = splitTask.file().partition();
+                    // Counts the number of partitions read
+                    partitionPathSet.add(structLike.toString());
+                }
+                String originalPath = splitTask.file().path().toString();
+                LocationPath locationPath = new LocationPath(originalPath, source.getCatalog().getProperties());
+                IcebergSplit split = new IcebergSplit(
+                        locationPath,
+                        splitTask.start(),
+                        splitTask.length(),
+                        splitTask.file().fileSizeInBytes(),
+                        new String[0],
+                        formatVersion,
+                        source.getCatalog().getProperties(),
+                        new ArrayList<>(),
+                        originalPath);
+                split.setTargetSplitSize(realFileSplitSize);
+                if (formatVersion >= MIN_DELETE_FILE_SUPPORT_VERSION) {
+                    split.setDeleteFileFilters(getDeleteFileFilters(splitTask));
+                }
+                split.setTableFormatType(TableFormatType.ICEBERG);
+                splits.add(split);
+            }));
+        }
     }
 }
