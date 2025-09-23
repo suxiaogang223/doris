@@ -483,6 +483,7 @@ public class IcebergScanNode extends FileQueryScanNode {
             List<CompletableFuture<Void>> futures = new ArrayList<>();
             
             for (int multiplier = 0; multiplier < splitMultiplier; multiplier++) {
+                final int currentMultiplier = multiplier; // Capture for lambda
                 CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
                     taskList.parallelStream().forEach(taskGrp -> {
                         taskGrp.files().forEach(splitTask -> {
@@ -493,7 +494,25 @@ public class IcebergScanNode extends FileQueryScanNode {
                                     concurrentPartitionPathSet.put(structLike.toString(), true);
                                 }
                                 String originalPath = splitTask.file().path().toString();
-                                LocationPath locationPath = new LocationPath(originalPath, 
+                                
+                                // 为避免重复的split文件路径，为每个multiplier添加随机后缀
+                                String randomizedPath = originalPath;
+                                if (currentMultiplier > 0) {
+                                    // 在文件路径中添加随机后缀，确保每个multiplier的路径都不同
+                                    String randomSuffix = "_split_" + currentMultiplier + "_" + 
+                                            System.nanoTime() + "_" + Thread.currentThread().getId();
+                                    int lastDotIndex = originalPath.lastIndexOf('.');
+                                    if (lastDotIndex > 0) {
+                                        // 在文件扩展名前插入后缀
+                                        randomizedPath = originalPath.substring(0, lastDotIndex) + 
+                                                randomSuffix + originalPath.substring(lastDotIndex);
+                                    } else {
+                                        // 如果没有扩展名，直接在末尾添加后缀
+                                        randomizedPath = originalPath + randomSuffix;
+                                    }
+                                }
+                                
+                                LocationPath locationPath = new LocationPath(randomizedPath, 
                                     source.getCatalog().getProperties());
                                 IcebergSplit split = new IcebergSplit(
                                         locationPath,
@@ -504,7 +523,7 @@ public class IcebergScanNode extends FileQueryScanNode {
                                         formatVersion,
                                         source.getCatalog().getProperties(),
                                         new ArrayList<>(),
-                                        originalPath);
+                                        originalPath); // 保持原始路径用于后续处理
                                 split.setTargetSplitSize(realFileSplitSize);
                                 if (formatVersion >= MIN_DELETE_FILE_SUPPORT_VERSION) {
                                     split.setDeleteFileFilters(getDeleteFileFilters(splitTask));
@@ -555,8 +574,8 @@ public class IcebergScanNode extends FileQueryScanNode {
                                         int formatVersion,
                                         long realFileSplitSize) {
         
-        int remainingMultiplier = splitMultiplier;
-        while (remainingMultiplier-- > 0) {
+        for (int multiplier = 0; multiplier < splitMultiplier; multiplier++) {
+            final int currentMultiplier = multiplier;
             combinedScanTasks.forEach(taskGrp -> taskGrp.files().forEach(splitTask -> {
                 if (isPartitionedTable) {
                     StructLike structLike = splitTask.file().partition();
@@ -564,7 +583,25 @@ public class IcebergScanNode extends FileQueryScanNode {
                     partitionPathSet.add(structLike.toString());
                 }
                 String originalPath = splitTask.file().path().toString();
-                LocationPath locationPath = new LocationPath(originalPath, source.getCatalog().getProperties());
+                
+                // 为避免重复的split文件路径，为每个multiplier添加随机后缀
+                String randomizedPath = originalPath;
+                if (currentMultiplier > 0) {
+                    // 在文件路径中添加随机后缀，确保每个multiplier的路径都不同
+                    String randomSuffix = "_split_" + currentMultiplier + "_" + 
+                            System.nanoTime() + "_" + Thread.currentThread().getId();
+                    int lastDotIndex = originalPath.lastIndexOf('.');
+                    if (lastDotIndex > 0) {
+                        // 在文件扩展名前插入后缀
+                        randomizedPath = originalPath.substring(0, lastDotIndex) + 
+                                randomSuffix + originalPath.substring(lastDotIndex);
+                    } else {
+                        // 如果没有扩展名，直接在末尾添加后缀
+                        randomizedPath = originalPath + randomSuffix;
+                    }
+                }
+                
+                LocationPath locationPath = new LocationPath(randomizedPath, source.getCatalog().getProperties());
                 IcebergSplit split = new IcebergSplit(
                         locationPath,
                         splitTask.start(),
@@ -574,7 +611,7 @@ public class IcebergScanNode extends FileQueryScanNode {
                         formatVersion,
                         source.getCatalog().getProperties(),
                         new ArrayList<>(),
-                        originalPath);
+                        originalPath); // 保持原始路径用于后续处理
                 split.setTargetSplitSize(realFileSplitSize);
                 if (formatVersion >= MIN_DELETE_FILE_SUPPORT_VERSION) {
                     split.setDeleteFileFilters(getDeleteFileFilters(splitTask));
