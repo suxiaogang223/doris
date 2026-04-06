@@ -73,7 +73,7 @@ TEST(IcebergDeleteFileReaderHelperTest, IsNotDeletionVectorWhenContentMissing) {
 
 TEST(IcebergDeleteFileReaderHelperTest, ReadMixedEncodingParquetPositionDeleteFile) {
     RuntimeProfile profile("test_profile");
-    RuntimeState runtime_state((TQueryOptions()), TQueryGlobals());
+    RuntimeState runtime_state(TQueryGlobals());
     FileMetaCache meta_cache(1024);
     IcebergDeleteFileIOContext io_context(&runtime_state);
 
