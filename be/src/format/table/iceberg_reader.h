@@ -19,6 +19,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -33,6 +35,7 @@
 #include "format/orc/vorc_reader.h"
 #include "format/parquet/vparquet_reader.h"
 #include "format/table/iceberg_reader_mixin.h"
+#include "format/table/table_reader.h"
 #include "storage/olap_common.h"
 
 namespace tparquet {
@@ -62,6 +65,85 @@ class VExprContext;
 
 struct IcebergTableReader {
     static bool _is_fully_dictionary_encoded(const tparquet::ColumnMetaData& column_metadata);
+};
+
+class IcebergParquetTableReader final : public TableReader {
+public:
+    IcebergParquetTableReader(ShardedKVCache* kv_cache, RuntimeProfile* profile,
+                              const TFileScanRangeParams& params, const TFileRangeDesc& range,
+                              size_t batch_size, const cctz::time_zone* ctz, io::IOContext* io_ctx,
+                              RuntimeState* state, FileMetaCache* meta_cache);
+
+    void set_create_row_id_column_iterator_func(
+            std::function<std::shared_ptr<segment_v2::RowIdColumnIteratorV2>()> create_func) {
+        _create_topn_row_id_column_iterator = std::move(create_func);
+    }
+
+    Status open(const TableReadTask& task) override;
+    Status next_block(Block* block, size_t* read_rows, bool* eof) override;
+    Status close() override;
+
+private:
+    Status _build_format_scan_task(const TableReadTask& task, FormatScanTask* format_task);
+    FieldMappingNode _build_schema_mapping(const TupleDescriptor* tuple_descriptor,
+                                           const FieldDescriptor& parquet_schema);
+    std::vector<RequiredField> _collect_required_fields(const TupleDescriptor* tuple_descriptor,
+                                                        const FieldDescriptor& parquet_schema,
+                                                        ReaderInitContext* ctx);
+    RowVisibility _build_row_visibility();
+    VirtualColumnPlan _build_virtual_column_plan();
+    Status _finalize_block(PhysicalReadBatch* batch, Block* output_block, size_t* read_rows);
+    Status _apply_equality_delete(PhysicalReadBatch* batch);
+    Status _fill_iceberg_row_id(Block* block,
+                                const std::vector<segment_v2::rowid_t>& row_positions);
+    Status _fill_row_lineage_columns(Block* block,
+                                     const std::vector<segment_v2::rowid_t>& row_positions);
+    Status _project_output(Block* block, const std::vector<std::string>& hidden_columns);
+    static Status _build_iceberg_rowid_column(const DataTypePtr& type, const std::string& file_path,
+                                              const std::vector<segment_v2::rowid_t>& row_ids,
+                                              int32_t partition_spec_id,
+                                              const std::string& partition_data_json,
+                                              MutableColumnPtr* column_out);
+
+    ShardedKVCache* _kv_cache = nullptr;
+    RuntimeProfile* _profile = nullptr;
+    const TFileScanRangeParams& _scan_params;
+    const TFileRangeDesc& _scan_range;
+    size_t _batch_size = 0;
+    const cctz::time_zone* _ctz = nullptr;
+    io::IOContext* _io_ctx = nullptr;
+    RuntimeState* _state = nullptr;
+    FileMetaCache* _meta_cache = nullptr;
+    std::unique_ptr<FileFormatReader> _file_reader;
+    TableReadTask _table_task;
+    Block _output_template;
+    std::function<std::shared_ptr<segment_v2::RowIdColumnIteratorV2>()>
+            _create_topn_row_id_column_iterator;
+};
+
+class IcebergParquetReaderAdapter final : public GenericReader {
+public:
+    ENABLE_FACTORY_CREATOR(IcebergParquetReaderAdapter);
+
+    IcebergParquetReaderAdapter(ShardedKVCache* kv_cache, RuntimeProfile* profile,
+                                const TFileScanRangeParams& params, const TFileRangeDesc& range,
+                                size_t batch_size, const cctz::time_zone* ctz,
+                                io::IOContext* io_ctx, RuntimeState* state,
+                                FileMetaCache* meta_cache);
+
+    void set_create_row_id_column_iterator_func(
+            std::function<std::shared_ptr<segment_v2::RowIdColumnIteratorV2>()> create_func) {
+        _table_reader.set_create_row_id_column_iterator_func(std::move(create_func));
+    }
+
+    Status close() override { return _table_reader.close(); }
+
+protected:
+    Status _do_init_reader(ReaderInitContext* ctx) override;
+    Status _do_get_next_block(Block* block, size_t* read_rows, bool* eof) override;
+
+private:
+    IcebergParquetTableReader _table_reader;
 };
 
 // IcebergParquetReader: inherits ParquetReader via IcebergReaderMixin CRTP

@@ -106,6 +106,136 @@ ParquetReader::ParquetReader(RuntimeProfile* profile, const TFileScanRangeParams
     _init_file_description();
 }
 
+Status ParquetReader::open(const FormatScanTask& task) {
+    _composition_task = task;
+    _composition_delete_rows.clear();
+    _delete_rows = nullptr;
+    _delete_rows_index = 0;
+    _composition_schema.root = task.schema_mapping_root;
+    _composition_schema.has_iceberg_field_ids = false;
+
+    std::set<uint64_t> column_ids;
+    std::set<uint64_t> filter_column_ids;
+    std::vector<std::string> column_names;
+    std::vector<std::string> predicate_names;
+    const auto collect_required = [&](const RequiredField& field) {
+        if (field.purpose == RequiredFieldPurpose::LEVELS_ONLY ||
+            field.purpose == RequiredFieldPurpose::REFERENCE_LEVELS) {
+            return;
+        }
+        column_names.push_back(field.table_path);
+        if (field.purpose == RequiredFieldPurpose::PREDICATE) {
+            predicate_names.push_back(field.table_path);
+        }
+    };
+    for (const auto& field : task.required_fields) {
+        collect_required(field);
+    }
+
+    std::function<void(const FieldMappingNode&)> collect_column_ids =
+            [&](const FieldMappingNode& node) {
+                if (node.physical.has_value()) {
+                    _composition_schema.has_iceberg_field_ids |= node.iceberg_field_id >= 0;
+                    column_ids.insert(node.physical->column_id);
+                    if (std::find(predicate_names.begin(), predicate_names.end(),
+                                  node.table_path) != predicate_names.end()) {
+                        filter_column_ids.insert(node.physical->column_id);
+                    }
+                }
+                for (const auto& child : node.children) {
+                    collect_column_ids(child);
+                }
+            };
+    collect_column_ids(task.schema_mapping_root);
+
+    _composition_delete_rows.insert(_composition_delete_rows.end(),
+                                    task.row_visibility.deleted_rows.begin(),
+                                    task.row_visibility.deleted_rows.end());
+    for (size_t i = 0; i < task.row_visibility.deletion_vector.size(); ++i) {
+        if (task.row_visibility.deletion_vector[i] != 0) {
+            _composition_delete_rows.push_back(static_cast<int64_t>(i));
+        }
+    }
+    if (!_composition_delete_rows.empty()) {
+        std::sort(_composition_delete_rows.begin(), _composition_delete_rows.end());
+        _composition_delete_rows.erase(
+                std::unique(_composition_delete_rows.begin(), _composition_delete_rows.end()),
+                _composition_delete_rows.end());
+        set_delete_rows(&_composition_delete_rows);
+    }
+
+    auto* legacy_ctx = task.read_context.legacy_init_context;
+    DORIS_CHECK(legacy_ctx != nullptr);
+    _composition_init_context = std::make_unique<ParquetInitContext>();
+    _composition_init_context->state = legacy_ctx->state;
+    _composition_init_context->tuple_descriptor = legacy_ctx->tuple_descriptor;
+    _composition_init_context->row_descriptor = legacy_ctx->row_descriptor;
+    _composition_init_context->params = legacy_ctx->params;
+    _composition_init_context->range = legacy_ctx->range;
+    _composition_init_context->push_down_agg_type = legacy_ctx->push_down_agg_type;
+    _composition_init_context->col_name_to_block_idx = legacy_ctx->col_name_to_block_idx;
+    _composition_init_context->column_names = std::move(column_names);
+    _composition_init_context->table_info_node = legacy_ctx->table_info_node;
+    _composition_init_context->column_ids = std::move(column_ids);
+    _composition_init_context->filter_column_ids = std::move(filter_column_ids);
+
+    // Standalone context avoids TableFormatReader hooks. In the composition
+    // model, IcebergTableReader owns partition/missing/generated semantics and
+    // ParquetReader only receives the physical task.
+    RETURN_IF_ERROR(init_reader(_composition_init_context.get()));
+    return Status::OK();
+}
+
+Status ParquetReader::set_output_template(const Block& block) {
+    _composition_output_template = block;
+    return Status::OK();
+}
+
+Status ParquetReader::next_batch(PhysicalReadBatch* batch, bool* eof) {
+    DORIS_CHECK(_composition_task.has_value());
+    batch->physical_block = _composition_output_template;
+
+    size_t read_rows = 0;
+    RETURN_IF_ERROR(get_next_block(&batch->physical_block, &read_rows, eof));
+    batch->physical_rows = read_rows;
+    if (read_rows == 0) {
+        batch->selection.reset(0);
+        return Status::OK();
+    }
+
+    batch->selection.reset(read_rows);
+    const auto& positions = current_batch_row_positions();
+    if (_composition_task->need_row_positions ||
+        _composition_task->row_visibility.needs_row_positions()) {
+        batch->row_positions.assign(positions.begin(), positions.end());
+        DORIS_CHECK(batch->row_positions.size() == read_rows);
+        for (size_t i = 0; i < read_rows; ++i) {
+            if (!_composition_task->row_visibility.is_visible(batch->row_positions[i])) {
+                batch->selection.selected[i] = 0;
+            }
+        }
+    }
+
+    RETURN_IF_ERROR(_materialize_virtual_columns(
+            &batch->physical_block, read_rows,
+            _composition_task->virtual_columns.predicate_virtual_columns, &batch->selection));
+
+    // Existing RowGroupReader already performs Parquet lazy materialization. The
+    // composition boundary keeps that contract explicit: predicate columns and
+    // predicate virtual columns define the selection, then payload columns are
+    // read only for surviving rows by the underlying Parquet machinery.
+    RETURN_IF_ERROR(_materialize_virtual_columns(
+            &batch->physical_block, batch->selection.selected_rows(),
+            _composition_task->virtual_columns.payload_virtual_columns, &batch->selection));
+
+    for (const auto& field : _composition_task->required_fields) {
+        if (field.hidden) {
+            batch->hidden_columns.push_back(field.table_path);
+        }
+    }
+    return Status::OK();
+}
+
 void ParquetReader::set_batch_size(size_t batch_size) {
     if (_batch_size == batch_size) {
         return;
@@ -554,6 +684,16 @@ void ParquetReader::_init_read_columns(const std::vector<std::string>& column_na
             _read_table_columns_set.insert(required_file_columns[name]);
         }
     }
+}
+
+Status ParquetReader::_materialize_virtual_columns(
+        Block* block, size_t rows,
+        const std::unordered_map<std::string, VirtualColumnPlan::MaterializeFn>& handlers,
+        const SelectionVector* selection) {
+    for (const auto& [_, handler] : handlers) {
+        RETURN_IF_ERROR(handler(block, rows, selection));
+    }
+    return Status::OK();
 }
 
 bool ParquetReader::_exists_in_file(const std::string& expr_name) const {

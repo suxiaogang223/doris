@@ -1374,10 +1374,12 @@ Status FileScanner::_init_parquet_reader(FileMetaCache* file_meta_cache_ptr,
 
     if (range.__isset.table_format_params &&
         range.table_format_params.table_format_type == "iceberg") {
-        // IcebergParquetReader IS-A ParquetReader (CRTP mixin), no wrapping needed
-        std::unique_ptr<IcebergParquetReader> iceberg_reader = IcebergParquetReader::create_unique(
-                _kv_cache, _profile, *_params, range, _state->batch_size(), &_state->timezone_obj(),
-                _io_ctx.get(), _state, file_meta_cache_ptr);
+        // Experimental composition path: IcebergTableReader HAS-A ParquetReader
+        // through a thin GenericReader adapter for FileScanner.
+        std::unique_ptr<IcebergParquetReaderAdapter> iceberg_reader =
+                IcebergParquetReaderAdapter::create_unique(
+                        _kv_cache, _profile, *_params, range, _state->batch_size(),
+                        &_state->timezone_obj(), _io_ctx.get(), _state, file_meta_cache_ptr);
         iceberg_reader->set_create_row_id_column_iterator_func(
                 [this]() -> std::shared_ptr<segment_v2::RowIdColumnIteratorV2> {
                     return _create_row_id_column_iterator();

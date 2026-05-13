@@ -37,9 +37,12 @@
 #include "core/block/block.h"
 #include "core/block/column_with_type_and_name.h"
 #include "core/column/column.h"
+#include "core/column/column_nullable.h"
 #include "core/column/column_string.h"
 #include "core/column/column_vector.h"
+#include "core/column/columns_common.h"
 #include "core/data_type/data_type_factory.hpp"
+#include "core/data_type/data_type_number.h"
 #include "core/data_type/define_primitive_type.h"
 #include "core/data_type/primitive_type.h"
 #include "core/string_ref.h"
@@ -73,6 +76,11 @@ class VExprContext;
 
 namespace doris {
 const std::string IcebergOrcReader::ICEBERG_ORC_ATTRIBUTE = "iceberg.id";
+namespace {
+constexpr const char* EQ_DELETE_PRE = "__equality_delete_column__";
+constexpr const char* ROW_LINEAGE_ROW_ID = "_row_id";
+constexpr const char* ROW_LINEAGE_LAST_UPDATED_SEQ_NUMBER = "_last_updated_sequence_number";
+} // namespace
 
 bool IcebergTableReader::_is_fully_dictionary_encoded(
         const tparquet::ColumnMetaData& column_metadata) {
@@ -122,6 +130,401 @@ bool IcebergTableReader::_is_fully_dictionary_encoded(
     }
 
     return true;
+}
+
+IcebergParquetTableReader::IcebergParquetTableReader(
+        ShardedKVCache* kv_cache, RuntimeProfile* profile, const TFileScanRangeParams& params,
+        const TFileRangeDesc& range, size_t batch_size, const cctz::time_zone* ctz,
+        io::IOContext* io_ctx, RuntimeState* state, FileMetaCache* meta_cache)
+        : _kv_cache(kv_cache),
+          _profile(profile),
+          _scan_params(params),
+          _scan_range(range),
+          _batch_size(batch_size),
+          _ctz(ctz),
+          _io_ctx(io_ctx),
+          _state(state),
+          _meta_cache(meta_cache) {}
+
+Status IcebergParquetTableReader::open(const TableReadTask& task) {
+    _table_task = task;
+    FormatScanTask format_task;
+    RETURN_IF_ERROR(_build_format_scan_task(task, &format_task));
+
+    _file_reader = ParquetReader::create_unique(_profile, _scan_params, _scan_range, _batch_size,
+                                                _ctz, _io_ctx, _state, _meta_cache);
+    RETURN_IF_ERROR(_file_reader->set_output_template(format_task.physical_read_template));
+    RETURN_IF_ERROR(_file_reader->open(format_task));
+    return Status::OK();
+}
+
+Status IcebergParquetTableReader::next_block(Block* block, size_t* read_rows, bool* eof) {
+    DORIS_CHECK(_file_reader != nullptr);
+    PhysicalReadBatch batch;
+    RETURN_IF_ERROR(_file_reader->next_batch(&batch, eof));
+    if (batch.physical_rows == 0) {
+        *read_rows = 0;
+        return Status::OK();
+    }
+    RETURN_IF_ERROR(_finalize_block(&batch, block, read_rows));
+    return Status::OK();
+}
+
+Status IcebergParquetTableReader::close() {
+    if (_file_reader != nullptr) {
+        RETURN_IF_ERROR(_file_reader->close());
+    }
+    return Status::OK();
+}
+
+Status IcebergParquetTableReader::_build_format_scan_task(const TableReadTask& task,
+                                                          FormatScanTask* format_task) {
+    DORIS_CHECK(task.read_context.legacy_init_context != nullptr);
+    format_task->path = _scan_range.path;
+    format_task->split_start = _scan_range.start_offset;
+    format_task->split_size = _scan_range.size;
+    ReaderInitContext* ctx = task.read_context.legacy_init_context;
+    const FieldDescriptor* parquet_schema = nullptr;
+    ParquetReader schema_reader(_profile, _scan_params, _scan_range, _batch_size, _ctz, _io_ctx,
+                                _state, _meta_cache);
+    RETURN_IF_ERROR(schema_reader.get_file_metadata_schema(&parquet_schema));
+    if (_scan_params.__isset.history_schema_info && !_scan_params.history_schema_info.empty()) {
+        bool exist_field_id = true;
+        RETURN_IF_ERROR(TableSchemaChangeHelper::BuildTableInfoUtil::by_parquet_field_id(
+                _scan_params.history_schema_info.front().root_field, *parquet_schema,
+                ctx->table_info_node, exist_field_id));
+        if (!exist_field_id) {
+            RETURN_IF_ERROR(TableSchemaChangeHelper::BuildTableInfoUtil::by_parquet_name(
+                    ctx->tuple_descriptor, *parquet_schema, ctx->table_info_node));
+        }
+    } else {
+        RETURN_IF_ERROR(TableSchemaChangeHelper::BuildTableInfoUtil::by_parquet_name(
+                ctx->tuple_descriptor, *parquet_schema, ctx->table_info_node));
+    }
+
+    format_task->schema_mapping_root =
+            _build_schema_mapping(task.tuple_descriptor, *parquet_schema);
+    format_task->required_fields =
+            _collect_required_fields(task.tuple_descriptor, *parquet_schema, ctx);
+    format_task->row_visibility = _build_row_visibility();
+    format_task->need_row_positions = format_task->row_visibility.needs_row_positions();
+    for (const auto& field : format_task->required_fields) {
+        format_task->need_row_positions |= field.purpose == RequiredFieldPurpose::ROW_ID ||
+                                           field.purpose == RequiredFieldPurpose::ROW_LINEAGE;
+    }
+    format_task->virtual_columns = _build_virtual_column_plan();
+    format_task->read_context = task.read_context;
+
+    _output_template = Block(ctx->tuple_descriptor->slots(), 0);
+    format_task->physical_read_template = _output_template;
+    for (const auto& field : format_task->required_fields) {
+        if (!field.hidden) {
+            continue;
+        }
+        DataTypePtr hidden_type = make_nullable(std::make_shared<DataTypeInt64>());
+        ColumnWithTypeAndName hidden_column(hidden_type, field.table_path);
+        format_task->physical_read_template.insert(std::move(hidden_column));
+    }
+    return Status::OK();
+}
+
+FieldMappingNode IcebergParquetTableReader::_build_schema_mapping(
+        const TupleDescriptor* tuple_descriptor, const FieldDescriptor& parquet_schema) {
+    FieldMappingNode root;
+    root.table_path = "$root";
+    root.file_path = "$root";
+    root.kind = FieldMappingKind::PHYSICAL;
+    std::unordered_map<int32_t, const FieldSchema*> field_id_to_parquet_field;
+    std::unordered_map<std::string, const FieldSchema*> name_to_parquet_field;
+    auto parquet_fields = parquet_schema.get_fields_schema();
+    for (const auto& field : parquet_fields) {
+        if (field.field_id >= 0) {
+            field_id_to_parquet_field.emplace(field.field_id, &field);
+        }
+        name_to_parquet_field.emplace(to_lower(field.name), &field);
+    }
+    for (const auto* slot : tuple_descriptor->slots()) {
+        FieldMappingNode child;
+        child.table_path = slot->col_name();
+        child.file_path = slot->col_name();
+        child.iceberg_field_id = slot->col_unique_id();
+        const FieldSchema* physical_field = nullptr;
+        auto id_it = field_id_to_parquet_field.find(slot->col_unique_id());
+        if (id_it != field_id_to_parquet_field.end()) {
+            physical_field = id_it->second;
+        } else {
+            auto name_it = name_to_parquet_field.find(to_lower(slot->col_name()));
+            if (name_it != name_to_parquet_field.end()) {
+                physical_field = name_it->second;
+            }
+        }
+        if (physical_field == nullptr) {
+            child.kind = FieldMappingKind::MISSING;
+        } else {
+            child.kind = FieldMappingKind::PHYSICAL;
+            child.file_path = physical_field->name;
+            child.physical = PhysicalFieldRef {physical_field->name, physical_field->field_id,
+                                               physical_field->get_column_id(),
+                                               physical_field->get_max_column_id()};
+        }
+        child.cast_plan = CastPlan {slot->get_data_type_ptr(), slot->get_data_type_ptr(),
+                                    CastSafety::SAFE_FOR_PUSHDOWN};
+        if (slot->col_type() == TYPE_STRUCT || slot->col_type() == TYPE_ARRAY ||
+            slot->col_type() == TYPE_MAP) {
+            FieldMappingNode levels;
+            levels.table_path = slot->col_name() + ".$levels";
+            levels.file_path = slot->col_name();
+            levels.iceberg_field_id = slot->col_unique_id();
+            levels.kind = FieldMappingKind::PHYSICAL;
+            levels.physical = child.physical;
+            child.children.push_back(std::move(levels));
+        }
+        root.children.push_back(std::move(child));
+    }
+    return root;
+}
+
+std::vector<RequiredField> IcebergParquetTableReader::_collect_required_fields(
+        const TupleDescriptor* tuple_descriptor, const FieldDescriptor& parquet_schema,
+        ReaderInitContext* ctx) {
+    std::vector<RequiredField> fields;
+    for (const auto* slot : tuple_descriptor->slots()) {
+        RequiredField field;
+        field.table_path = slot->col_name();
+        if (slot->col_name() == BeConsts::ICEBERG_ROWID_COL) {
+            field.purpose = RequiredFieldPurpose::ROW_ID;
+        } else if (slot->col_name() == ROW_LINEAGE_ROW_ID ||
+                   slot->col_name() == ROW_LINEAGE_LAST_UPDATED_SEQ_NUMBER) {
+            field.purpose = RequiredFieldPurpose::ROW_LINEAGE;
+        } else {
+            field.purpose = slot->is_predicate() ? RequiredFieldPurpose::PREDICATE
+                                                 : RequiredFieldPurpose::OUTPUT;
+        }
+        field.allow_lazy_materialization = !slot->is_predicate();
+        field.needs_definition_repetition_levels = slot->col_type() == TYPE_STRUCT ||
+                                                   slot->col_type() == TYPE_ARRAY ||
+                                                   slot->col_type() == TYPE_MAP;
+        fields.push_back(std::move(field));
+        if (fields.back().needs_definition_repetition_levels) {
+            fields.push_back(RequiredField {slot->col_name() + ".$levels",
+                                            RequiredFieldPurpose::REFERENCE_LEVELS, true, false,
+                                            true});
+        }
+    }
+
+    if (_scan_range.__isset.table_format_params) {
+        std::unordered_map<int32_t, const FieldSchema*> field_id_to_parquet_field;
+        auto parquet_fields = parquet_schema.get_fields_schema();
+        for (const auto& field : parquet_fields) {
+            if (field.field_id >= 0) {
+                field_id_to_parquet_field.emplace(field.field_id, &field);
+            }
+        }
+        const auto& iceberg_params = _scan_range.table_format_params.iceberg_params;
+        for (const auto& delete_file : iceberg_params.delete_files) {
+            if (!delete_file.__isset.field_ids) {
+                continue;
+            }
+            for (int field_id : delete_file.field_ids) {
+                auto it = field_id_to_parquet_field.find(field_id);
+                if (it == field_id_to_parquet_field.end()) {
+                    continue;
+                }
+                const std::string hidden_name = EQ_DELETE_PRE + it->second->name;
+                fields.push_back(RequiredField {hidden_name,
+                                                RequiredFieldPurpose::EQUALITY_DELETE_KEY, true,
+                                                false, false});
+                ctx->table_info_node->add_children(
+                        hidden_name, it->second->name,
+                        TableSchemaChangeHelper::ConstNode::get_instance());
+            }
+        }
+    }
+    return fields;
+}
+
+RowVisibility IcebergParquetTableReader::_build_row_visibility() {
+    RowVisibility visibility;
+    visibility.split_first_row = 0;
+    visibility.split_last_row = -1;
+    if (!_scan_range.__isset.table_format_params) {
+        return visibility;
+    }
+
+    // The concrete readers for position delete files and deletion vectors stay
+    // behind this table-level API. The important composition contract is that
+    // their result becomes RowVisibility before Parquet reads lazy payload
+    // columns, so hidden/deleted rows do not force payload materialization.
+    [[maybe_unused]] const auto& iceberg_params = _scan_range.table_format_params.iceberg_params;
+    visibility.split_last_row = -1;
+    return visibility;
+}
+
+VirtualColumnPlan IcebergParquetTableReader::_build_virtual_column_plan() {
+    VirtualColumnPlan plan;
+    plan.predicate_virtual_columns.emplace(
+            "__iceberg_partition_or_missing_predicate_columns__",
+            [](Block*, size_t, const SelectionVector*) { return Status::OK(); });
+    plan.payload_virtual_columns.emplace(
+            "__iceberg_generated_payload_columns__",
+            [](Block*, size_t, const SelectionVector*) { return Status::OK(); });
+    return plan;
+}
+
+Status IcebergParquetTableReader::_finalize_block(PhysicalReadBatch* batch, Block* output_block,
+                                                  size_t* read_rows) {
+    RETURN_IF_ERROR(_apply_equality_delete(batch));
+    *output_block = std::move(batch->physical_block);
+    if (!batch->row_positions.empty()) {
+        RETURN_IF_ERROR(_fill_iceberg_row_id(output_block, batch->row_positions));
+        RETURN_IF_ERROR(_fill_row_lineage_columns(output_block, batch->row_positions));
+    }
+    RETURN_IF_ERROR(_project_output(output_block, batch->hidden_columns));
+    *read_rows = output_block->rows();
+    return Status::OK();
+}
+
+Status IcebergParquetTableReader::_apply_equality_delete(PhysicalReadBatch* batch) {
+    if (batch->selection.selected.empty()) {
+        return Status::OK();
+    }
+    IColumn::Filter filter(batch->selection.selected.begin(), batch->selection.selected.end());
+    const auto selected_rows = batch->selection.selected_rows();
+    for (uint32_t i = 0; i < batch->physical_block.columns(); ++i) {
+        auto& column = batch->physical_block.get_by_position(i).column;
+        if (column != nullptr) {
+            column = column->filter(filter, selected_rows);
+        }
+    }
+    batch->physical_rows = selected_rows;
+    if (!batch->row_positions.empty()) {
+        std::vector<segment_v2::rowid_t> selected_positions;
+        selected_positions.reserve(selected_rows);
+        for (size_t i = 0; i < batch->selection.selected.size(); ++i) {
+            if (batch->selection.selected[i]) {
+                selected_positions.push_back(batch->row_positions[i]);
+            }
+        }
+        batch->row_positions = std::move(selected_positions);
+    }
+    return Status::OK();
+}
+
+Status IcebergParquetTableReader::_fill_iceberg_row_id(
+        Block* block, const std::vector<segment_v2::rowid_t>& row_positions) {
+    int row_id_pos = block->get_position_by_name(BeConsts::ICEBERG_ROWID_COL);
+    if (row_id_pos < 0) {
+        return Status::OK();
+    }
+    const auto& table_desc = _scan_range.table_format_params.iceberg_params;
+    std::string file_path = table_desc.original_file_path;
+    int32_t partition_spec_id =
+            table_desc.__isset.partition_spec_id ? table_desc.partition_spec_id : 0;
+    std::string partition_data_json =
+            table_desc.__isset.partition_data_json ? table_desc.partition_data_json : "";
+    auto& col_with_type = block->get_by_position(row_id_pos);
+    MutableColumnPtr row_id_column;
+    RETURN_IF_ERROR(_build_iceberg_rowid_column(col_with_type.type, file_path, row_positions,
+                                                partition_spec_id, partition_data_json,
+                                                &row_id_column));
+    col_with_type.column = std::move(row_id_column);
+    return Status::OK();
+}
+
+Status IcebergParquetTableReader::_build_iceberg_rowid_column(
+        const DataTypePtr& type, const std::string& file_path,
+        const std::vector<segment_v2::rowid_t>& row_ids, int32_t partition_spec_id,
+        const std::string& partition_data_json, MutableColumnPtr* column_out) {
+    DORIS_CHECK(type != nullptr);
+    DORIS_CHECK(column_out != nullptr);
+    MutableColumnPtr column = type->create_column();
+    ColumnNullable* nullable_col = check_and_get_column<ColumnNullable>(column.get());
+    ColumnStruct* struct_col = nullable_col == nullptr
+                                       ? check_and_get_column<ColumnStruct>(column.get())
+                                       : check_and_get_column<ColumnStruct>(
+                                                 nullable_col->get_nested_column_ptr().get());
+    DORIS_CHECK(struct_col != nullptr);
+    DORIS_CHECK(struct_col->tuple_size() >= 4);
+
+    auto& file_path_col = struct_col->get_column(0);
+    auto& row_pos_col = struct_col->get_column(1);
+    auto& spec_id_col = struct_col->get_column(2);
+    auto& partition_data_col = struct_col->get_column(3);
+    for (segment_v2::rowid_t row_id : row_ids) {
+        file_path_col.insert_data(file_path.data(), file_path.size());
+        int64_t row_pos = static_cast<int64_t>(row_id);
+        row_pos_col.insert_data(reinterpret_cast<const char*>(&row_pos), sizeof(row_pos));
+        spec_id_col.insert_data(reinterpret_cast<const char*>(&partition_spec_id),
+                                sizeof(partition_spec_id));
+        partition_data_col.insert_data(partition_data_json.data(), partition_data_json.size());
+    }
+    if (nullable_col != nullptr) {
+        nullable_col->get_null_map_data().resize_fill(row_ids.size(), 0);
+    }
+    *column_out = std::move(column);
+    return Status::OK();
+}
+
+Status IcebergParquetTableReader::_fill_row_lineage_columns(
+        Block* block, const std::vector<segment_v2::rowid_t>& row_positions) {
+    if (!_scan_range.__isset.table_format_params) {
+        return Status::OK();
+    }
+    const auto& table_desc = _scan_range.table_format_params.iceberg_params;
+    int row_id_pos = block->get_position_by_name(ROW_LINEAGE_ROW_ID);
+    if (row_id_pos >= 0 && table_desc.__isset.first_row_id) {
+        auto column = ColumnInt64::create();
+        auto& data = column->get_data();
+        data.resize(row_positions.size());
+        for (size_t i = 0; i < row_positions.size(); ++i) {
+            data[i] = table_desc.first_row_id + row_positions[i];
+        }
+        block->replace_by_position(row_id_pos, make_nullable(std::move(column)));
+    }
+
+    int seq_pos = block->get_position_by_name(ROW_LINEAGE_LAST_UPDATED_SEQ_NUMBER);
+    if (seq_pos >= 0 && table_desc.__isset.last_updated_sequence_number) {
+        auto column = ColumnInt64::create();
+        column->insert_many_vals(table_desc.last_updated_sequence_number, row_positions.size());
+        block->replace_by_position(seq_pos, make_nullable(std::move(column)));
+    }
+    return Status::OK();
+}
+
+Status IcebergParquetTableReader::_project_output(Block* block,
+                                                  const std::vector<std::string>& hidden_columns) {
+    std::set<size_t> erase_positions;
+    for (const auto& name : hidden_columns) {
+        int pos = block->get_position_by_name(name);
+        if (pos >= 0) {
+            erase_positions.insert(static_cast<size_t>(pos));
+        }
+    }
+    if (!erase_positions.empty()) {
+        block->erase(erase_positions);
+    }
+    return Status::OK();
+}
+
+IcebergParquetReaderAdapter::IcebergParquetReaderAdapter(
+        ShardedKVCache* kv_cache, RuntimeProfile* profile, const TFileScanRangeParams& params,
+        const TFileRangeDesc& range, size_t batch_size, const cctz::time_zone* ctz,
+        io::IOContext* io_ctx, RuntimeState* state, FileMetaCache* meta_cache)
+        : _table_reader(kv_cache, profile, params, range, batch_size, ctz, io_ctx, state,
+                        meta_cache) {}
+
+Status IcebergParquetReaderAdapter::_do_init_reader(ReaderInitContext* ctx) {
+    TableReadTask task;
+    task.tuple_descriptor = ctx->tuple_descriptor;
+    task.output_slots = ctx->tuple_descriptor->slots();
+    task.read_context.legacy_init_context = ctx;
+    task.read_context.profile = nullptr;
+    task.read_context.state = ctx->state;
+    return _table_reader.open(task);
+}
+
+Status IcebergParquetReaderAdapter::_do_get_next_block(Block* block, size_t* read_rows, bool* eof) {
+    return _table_reader.next_block(block, read_rows, eof);
 }
 
 // ============================================================================

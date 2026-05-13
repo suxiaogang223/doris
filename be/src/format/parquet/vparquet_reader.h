@@ -23,6 +23,7 @@
 
 #include <list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -35,6 +36,7 @@
 #include "format/parquet/vparquet_column_reader.h"
 #include "format/parquet/vparquet_group_reader.h"
 #include "format/table/table_format_reader.h"
+#include "format/table/table_reader.h"
 #include "format/table/table_schema_change_helper.h"
 #include "io/file_factory.h"
 #include "io/fs/file_meta_cache.h"
@@ -87,7 +89,7 @@ struct ParquetInitContext final : public ReaderInitContext {
     bool filter_groups = true;
 };
 
-class ParquetReader : public TableFormatReader {
+class ParquetReader : public TableFormatReader, public FileFormatReader {
     ENABLE_FACTORY_CREATOR(ParquetReader);
 
 public:
@@ -210,6 +212,13 @@ public:
     /// Disable row-group range filtering (needed when reading delete files
     /// whose TFileRangeDesc has size=-1).
     void set_filter_groups(bool v) { _filter_groups = v; }
+
+    // Experimental composition API. In this mode ParquetReader is the physical
+    // reader under a table reader, not the owner of table-format behavior.
+    Status open(const FormatScanTask& task) override;
+    Status set_output_template(const Block& block) override;
+    Status next_batch(PhysicalReadBatch* batch, bool* eof) override;
+    const PhysicalFileSchema& physical_schema() const override { return _composition_schema; }
 
 protected:
     // ---- Unified init_reader(ReaderInitContext*) overrides ----
@@ -348,6 +357,10 @@ private:
     bool _exists_in_file(const std::string& expr_name) const;
     bool _type_matches(const int cid) const;
     void _init_read_columns(const std::vector<std::string>& column_names);
+    Status _materialize_virtual_columns(
+            Block* block, size_t rows,
+            const std::unordered_map<std::string, VirtualColumnPlan::MaterializeFn>& handlers,
+            const SelectionVector* selection);
 
     io::FileSystemProperties _system_properties;
     io::FileDescription _file_description;
@@ -442,6 +455,12 @@ private:
 
     std::vector<std::unique_ptr<MutilColumnBlockPredicate>> _push_down_predicates;
     Arena _arena;
+
+    std::optional<FormatScanTask> _composition_task;
+    std::unique_ptr<ParquetInitContext> _composition_init_context;
+    std::vector<int64_t> _composition_delete_rows;
+    PhysicalFileSchema _composition_schema;
+    Block _composition_output_template;
 };
 
 } // namespace doris
