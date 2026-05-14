@@ -55,17 +55,73 @@ struct TableFilter {
     std::vector<std::shared_ptr<ColumnPredicate>> predicates;
 };
 
-// 表列与文件列之间的映射结果。
-// 这里同时保存文件类型、表类型、finalize 表达式和读时 fallback 表达式。
+// 单个 table column 到 file column 的映射结果。
+//
+// 这个结构是 table reader 和 file reader 的边界对象：
+// - table reader 使用它决定要向 ParquetReader 请求哪些 file-local columns；
+// - table reader 使用 finalize_expr 把 ParquetReader 返回的 file-local block 转成
+//   table/global schema block；
+// - TableColumnMapper 使用 reader_filter_expr 决定某些 table filter 是否可以在
+//   ParquetReader 内部先计算表达式后再过滤。
 struct ColumnMapping {
+    // table/global schema 中的列 id。Iceberg 场景下通常就是 Iceberg field id。
     ColumnId table_column_id = -1;
+
+    // 对应的 file-local column id。
+    // 没有值表示该 table column 不存在于当前文件中，例如 Iceberg 新增列、partition
+    // column、generated column 或需要由 default/null 表达式补齐的列。
     std::optional<ColumnId> file_column_id;
+
+    // 当前文件中该列的物理/逻辑类型。只有 file_column_id 存在时才有意义。
     DataTypePtr file_type;
+
+    // table/global schema 中该列的目标类型。final output block 必须符合这个类型。
     DataTypePtr table_type;
+
+    // file-local value 到 table/global value 的最终转换表达式。
+    //
+    // 典型场景：
+    // - trivial mapping: identity(file_col)
+    // - 类型 schema change: CAST(file_col AS table_type)
+    // - struct 字段重排/补默认值: remap_struct(file_col, child_mappings, defaults)
+    // - 文件缺失列: default/partition/generated/NULL expression
+    //
+    // 该表达式在 TableReader::finalize_chunk 阶段执行，输入是 ParquetReader 已经输出
+    // 的 file-local block，输出写入最终 table block。
     VExprContextSPtr finalize_expr;
+
+    // 为 filter fallback 准备的读时表达式。
+    //
+    // 当 table filter 不能直接转换成 file-local filter 时使用。例如：
+    // table col BIGINT, file col INT, WHERE col = 3000000000。
+    // 这个谓词不能安全变成 INT filter，因此 mapper 会生成：
+    //   reader_filter_expr = CAST(file_col AS BIGINT)
+    // 并把它放入 ParquetScanRequest::reader_expression_map。
+    //
+    // ParquetReader 仍然不理解 table/global schema；它只是在读取 file-local columns 后，
+    // 按 request 中的表达式计算一个临时列，再基于这个临时列执行过滤。这样能支持延时
+    // 物化阶段的 filter，同时避免把 schema evolution 逻辑塞进 column decoder。
+    //
+    // reader_filter_expr 和 finalize_expr 可能相同，但语义不同：
+    // - reader_filter_expr 服务于“读时过滤”，只在 filter 需要 fallback 时出现；
+    // - finalize_expr 服务于“输出成表层结果”，每个输出列都可能需要。
     VExprContextSPtr reader_filter_expr;
+
+    // 复杂类型的子字段映射。
+    // 对 struct/list/map，父列可能存在但子字段发生了新增、删除、重排或类型变化。
+    // child_mappings 描述这些子字段如何从 file-local nested schema 变成 table nested
+    // schema，并供 finalize_expr/remap_struct 以及 STRUCT_EXTRACT filter remap 使用。
     std::vector<ColumnMapping> child_mappings;
+
+    // 是否可以把 file column 原样视为 table column。
+    // trivial mapping 要求列存在、类型一致、复杂类型 child 顺序和类型也一致。只有这种
+    // 情况下 table filter 才能无语义损失地直接复制给 ParquetReader，用于 stats、
+    // dictionary、page index、bloom filter 等底层优化。
     bool is_trivial = false;
+
+    // 当前 table column 是否是文件级常量。
+    // 常见来源包括 partition value、Iceberg 新增列默认值、虚拟列常量部分等。常量列
+    // 不需要 ParquetReader 读取物理列，filter 也可以在 mapper/table reader 层直接求值。
     bool is_constant = false;
 };
 

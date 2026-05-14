@@ -104,15 +104,6 @@ public:
         return Status::OK();
     }
 
-    Status bind(const std::vector<reader::TableColumn>& iceberg_schema) {
-        // 伪逻辑：
-        // 1. 保存 Iceberg 当前 snapshot schema；
-        // 2. 生成 table/global columns；
-        // 3. 后续 initialize_reader 会用该 schema 和 parquet file columns 做 field-id mapping。
-        _iceberg_schema = iceberg_schema;
-        return Status::OK();
-    }
-
     Status init_scan(const reader::TableScanRequest& request) override {
         // 保存表层 projection/filter。这里仍然是 table/global schema 语义。
         _table_scan_request = request;
