@@ -63,7 +63,7 @@ struct ConditionCacheContext {
 
 /// Base context for the unified init_reader(ReaderInitContext*) template method.
 /// Contains fields shared by ALL reader types. Format-specific readers define
-/// subclasses (ParquetInitContext, OrcInitContext, etc.) with extra fields.
+/// subclasses (format-specific init contexts, etc.) with extra fields.
 /// FileScanner allocates the appropriate subclass and populates the shared fields
 /// before calling init_reader().
 struct ReaderInitContext {

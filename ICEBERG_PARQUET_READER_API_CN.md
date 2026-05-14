@@ -1,52 +1,98 @@
-# Doris Iceberg + Parquet 组合式 Reader API 说明
+# Doris Iceberg + Parquet split 驱动组合式 Reader API
 
-本文档描述当前实验分支 `experiment/table-reader-composition` 下的接口分层。
-目标是把 Iceberg 表语义和 Parquet 物理读取拆开，并验证 Doris 现有的延时物化、
-schema change、delete file、row id 生成是否能在这个边界内成立。
+本文档描述当前实验分支 `experiment/table-reader-composition` 的彻底重写版本。
 
-## 1. 分层职责
+这版实验不考虑编译，目标是删除旧的 `ParquetReader` 和 `IcebergReader`
+继承式实现，用伪代码级别的 API 重新表达 Doris BE 中 Iceberg + Parquet
+查询应该如何分层。
+
+## 1. Doris 的边界不是 MultiFile，而是 split
+
+DuckDB 有 `MultiFileReader` / `MultiFileList`，因为它的 table function
+框架需要在执行侧枚举文件。
+
+Doris 不应该照搬这个概念。Doris 的 Iceberg snapshot、manifest、data file
+枚举和 split 切分应该由 FE 完成。BE 只顺序消费 FE 下发的 `TFileRangeDesc`。
+
+因此 BE 里的分层是：
+
+```text
+FileScanner
+  IcebergReaderAdapter
+    IcebergTableReader
+      FileFormatReader
+        ParquetReader
+          ColumnReader API
+```
+
+`IcebergReaderAdapter` 只是旧 `FileScanner` 的 `GenericReader` 桥接层，不承载
+Iceberg 语义。
+
+## 2. 核心接口
 
 ### `TableReader`
-表层读取器，只负责最终 Doris `Block` 的构造与收尾。
 
-职责包括：
-- Iceberg snapshot / schema 语义
-- schema change 映射
-- partition / missing / generated / synthesized 列
-- equality delete / position delete / deletion vector
-- `_row_id` 和 row lineage 列
-- 最终投影与隐藏列清理
+表层 reader，输出最终 Doris `Block`。
+
+职责：
+
+- schema change
+- partition fallback
+- missing/default/generated/synthesized 列
+- equality delete
+- position delete / deletion vector
+- `$row_id`
+- row lineage
+- residual predicate
+- final projection
 
 ### `FileFormatReader`
-文件格式读取器，只负责单个 split 对应的物理文件读取。
 
-职责包括：
-- 打开文件与 footer / schema
-- row group / page 级过滤
-- lazy materialization
-- 物理列读取
-- row position 传递
-- 物理批次输出
+文件格式 reader，输出物理批次 `PhysicalReadBatch`。
+
+职责：
+
+- 打开物理文件
+- 读取 footer / schema
+- row group / page pruning
+- predicate column read
+- lazy payload read
+- levels-only read
+- row position 输出
+- hidden physical column 输出
 
 ### `ColumnReader`
-列级解码接口，只保留 API，不落具体实现。
 
-它的存在目的是把列解码、level 读取、skip/select/prefetch 这些能力单独抽象出来。
+列级 API。当前只定义接口，不实现具体解码。
 
-## 2. 关键接口
+职责边界：
+
+- `open`
+- `read`
+- `filter`
+- `select`
+- `skip`
+- `read_levels`
+- `register_prefetch`
+
+## 3. 关键数据结构
 
 ### `TableReadTask`
-表层输入任务，代表 FE 切给 BE 的一个 split。
+
+表层输入，代表一个 FE 切好的 split。
 
 包含：
+
 - `tuple_descriptor`
 - `output_slots`
 - `read_context`
 
 ### `FormatScanTask`
-文件层输入任务，代表表层已整理好的单个 split 物理读取任务。
+
+表层传给文件层的物理读取任务。
 
 包含：
+
 - `path`
 - `split_start`
 - `split_size`
@@ -59,9 +105,11 @@ schema change、delete file、row id 生成是否能在这个边界内成立。
 - `physical_read_template`
 
 ### `PhysicalReadBatch`
-文件层输出批次。
+
+文件层输出。
 
 包含：
+
 - `physical_block`
 - `selection`
 - `row_positions`
@@ -69,89 +117,136 @@ schema change、delete file、row id 生成是否能在这个边界内成立。
 - `physical_rows`
 
 ### `FieldMappingNode`
-递归 schema 映射节点。
 
-用途：
-- 表字段到文件字段映射
-- Iceberg field id 优先，name fallback
-- missing 字段表示
+递归 schema mapping。
+
+表达：
+
+- table path
+- file path
+- Iceberg field id
+- physical Parquet column id range
+- missing / partition / generated / synthesized
 - cast plan
-- 嵌套类型的 levels/reference 信息
+- nested children
+
+### `RequiredField`
+
+描述文件层为什么需要读某个字段。
+
+用途包括：
+
+- `OUTPUT`
+- `PREDICATE`
+- `EQUALITY_DELETE_KEY`
+- `ROW_ID`
+- `ROW_LINEAGE`
+- `LEVELS_ONLY`
+- `REFERENCE_LEVELS`
 
 ### `RowVisibility`
+
 描述行级可见性。
 
-用途：
+来源：
+
 - position delete
 - deletion vector
-- split 范围裁剪
+- split row range
 
-## 3. 当前执行流
+`RowVisibility` 必须在 Parquet lazy payload read 前生效，避免被删除的行触发
+payload 读取。
 
-### 3.1 表层
-`IcebergParquetTableReader::open()` 做表语义准备：
+## 4. 执行流程
 
-1. 读取 Parquet schema
-2. 构造 `FieldMappingNode`
-3. 构造 `required_fields`
-4. 解析 `RowVisibility`
-5. 生成 `VirtualColumnPlan`
-6. 组装 `FormatScanTask`
-7. 调用内部 `FileFormatReader`
+### 4.1 `IcebergTableReader::open`
 
-### 3.2 文件层
-`ParquetReader::open(const FormatScanTask&)` 只接收物理任务：
+伪代码流程：
 
-1. 接收 schema mapping
-2. 接收 required fields
-3. 接收 row visibility
-4. 接收 virtual column plan
-5. 初始化 Parquet footer / row group 读取
+1. 从 `TFileRangeDesc` 读取当前 split 的 Iceberg 元信息
+2. 创建 `ParquetReader`
+3. 调用 `ParquetReader::load_physical_schema`
+4. 构造递归 `FieldMappingNode`
+5. 构造 `IcebergDeletePlan`
+6. 构造 `RequiredField`
+7. 构造 `VirtualColumnPlan`
+8. 组装 `FormatScanTask`
+9. 调用 `ParquetReader::open`
 
-### 3.3 返回批次
-`ParquetReader::next_batch()` 返回 `PhysicalReadBatch`：
+### 4.2 `ParquetReader::next_batch`
 
-1. 先做物理过滤
-2. 再做 predicate virtual columns
-3. 再做 lazy payload materialization
-4. 输出 row positions
+伪代码流程：
 
-### 3.4 表层收尾
-`IcebergParquetTableReader::next_block()` 对 `PhysicalReadBatch` 做最终收尾：
+1. 选择下一个 row group
+2. 做 row group / page pruning
+3. 应用 `RowVisibility`
+4. 读取 predicate fields
+5. 物化 predicate virtual columns
+6. 计算 selection
+7. 按 selection lazy 读取 payload fields
+8. 读取 levels-only/reference-level fields
+9. 输出 row positions
+10. 输出 hidden equality-delete key columns
 
-1. equality delete 过滤
-2. `_row_id` 生成
-3. row lineage 生成
-4. 隐藏列清理
-5. 最终 `Block` 输出
+### 4.3 `IcebergTableReader::next_block`
 
-## 4. 这版设计要证明的能力
+伪代码流程：
+
+1. 接收 `PhysicalReadBatch`
+2. 应用 equality delete
+3. 应用 residual predicate
+4. 填充 missing / partition columns
+5. 填充 generated columns
+6. 生成 `$row_id` / row lineage
+7. 删除 hidden columns
+8. 输出最终 Doris `Block`
+
+## 5. 对关键优化的证明方式
 
 ### 延时物化
-物理列和谓词列分离，谓词先读，剩余 payload 后读。
+
+`RequiredField` 把 predicate 和 payload 分开。`ParquetReader` 先读 predicate，
+再按 selection 读 payload。
 
 ### schema change
-递归 `FieldMappingNode` 支持：
-- reorder
-- rename
-- missing 字段
-- nested struct / array / map
+
+`FieldMappingNode` 是递归树，不是平铺 map。它能表达 rename、reorder、missing、
+cast 和 nested mapping。
 
 ### nested missing
-`REFERENCE_LEVELS` / `LEVELS_ONLY` 允许读取层级信息而不是错误地按顶层行数填充。
 
-### delete
-表层先把 delete 语义压成 `RowVisibility` 或 hidden equality delete 字段，再交给文件层/表层处理。
+nested missing 通过 `REFERENCE_LEVELS` 或 `LEVELS_ONLY` 读取物理 sibling 的
+definition/repetition levels。表层填充时按 nested element cardinality，而不是按
+顶层 row count。
+
+### position delete / deletion vector
+
+它们被压成 `RowVisibility`，在 payload lazy read 前参与 selection。
+
+### equality delete
+
+equality delete key 被作为 hidden `RequiredField` 读取。表层 finalize 时过滤并
+删除 hidden columns。
 
 ### row id / lineage
-依赖 `row_positions`，由表层最终生成。
 
-## 5. 当前实验边界
+`FormatScanTask::need_row_positions` 要求文件层返回 `row_positions`。表层使用
+row position 和 split metadata 生成 `$row_id`、`_row_id`、
+`_last_updated_sequence_number`。
 
-这只是实验原型，不追求完整编译通过。
+## 6. 当前实验状态
 
-当前主要验证的是：
-- 表层和文件层是否能清晰解耦
-- 现有 Doris 优化是否能落进新接口
-- split 驱动模型是否足够支撑 Iceberg + Parquet
+当前版本有意删除旧实现并使用伪代码重写。
+
+不保证：
+
+- 编译通过
+- 非 Iceberg Parquet reader 仍可使用
+- ORC Iceberg reader 仍可使用
+
+保证表达：
+
+- Doris BE 的 split 驱动边界
+- Iceberg table semantics 和 Parquet physical read 的组合关系
+- 延时物化、schema change、delete、row id 能通过新 API 承载
 

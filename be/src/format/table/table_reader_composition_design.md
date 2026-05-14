@@ -1,60 +1,89 @@
-# Iceberg and Parquet reader composition experiment
+# Split-driven Iceberg + Parquet reader composition experiment
 
-This experiment makes the table-format reader and the physical file-format
-reader separate components.
+This experiment intentionally removes the old `IcebergReaderMixin<ParquetReader>`
+inheritance design from the Iceberg + Parquet path.
+
+Doris BE does not own Iceberg file enumeration. FE resolves the Iceberg snapshot,
+manifests and data files, then sends BE a sequence of `TFileRangeDesc` splits.
+Therefore the BE reader boundary is one split, not a multi-file planning layer.
+
+## Runtime stack
+
+```text
+FileScanner
+  IcebergReaderAdapter              // GenericReader bridge only
+    IcebergTableReader              // table-format semantics for one split
+      FileFormatReader
+        ParquetReader               // physical Parquet split reader
+          ColumnReader API          // column/page/level decoding boundary
+```
 
 ## Ownership split
 
-`TableReader` returns the final Doris `Block`. It owns table-format semantics:
-schema evolution, partition fallback, missing/default/generated columns,
-Iceberg delete files, row lineage columns, and final projection.
+`IcebergTableReader` owns table semantics:
 
-`FileFormatReader` returns `PhysicalReadBatch`. It owns only physical file
-work: opening file metadata, pruning row groups/pages, reading physical
-columns, applying file-level predicates, preserving row positions, and exposing
-hidden columns requested by the table layer.
+- Iceberg field-id schema mapping and name fallback
+- partition fallback
+- missing/default/generated/synthesized columns
+- equality delete, position delete and deletion vector planning
+- `$row_id`, `_row_id`, `_last_updated_sequence_number`
+- residual predicates and final projection
 
-`IcebergParquetTableReader` therefore has a `std::unique_ptr<FileFormatReader>`
-instead of inheriting from `ParquetReader`. `IcebergParquetReaderAdapter` exists
-only to let the current `FileScanner` keep a `GenericReader`.
+`ParquetReader` owns physical format semantics:
+
+- footer/schema loading
+- row group/page pruning
+- predicate-column read phase
+- lazy payload read phase
+- levels-only/reference-level reads for nested missing fields
+- row position propagation
+- hidden physical columns requested by the table layer
+
+`ColumnReader` is only an API in this experiment. It is the future home for
+page decoding, level reads, skip/select and prefetch.
 
 ## Lazy materialization contract
 
-`FormatScanTask::required_fields` distinguishes output, predicate, delete-key,
-row-id, row-lineage, and levels-only fields. Parquet uses that intent to keep
-the existing lazy materialization shape:
+`FormatScanTask::required_fields` classifies fields by purpose:
 
-1. read predicate physical fields;
-2. materialize predicate virtual fields through `VirtualColumnPlan`;
-3. evaluate visibility/predicate selection;
-4. read lazy payload fields only for selected rows;
-5. return row positions aligned with selected physical rows.
+- `PREDICATE`
+- `OUTPUT`
+- `EQUALITY_DELETE_KEY`
+- `ROW_ID`
+- `ROW_LINEAGE`
+- `LEVELS_ONLY`
+- `REFERENCE_LEVELS`
 
-Virtual fields are explicit because partition columns, missing columns, and
-generated columns can appear in predicates even though they are not Parquet
-columns.
+`ParquetReader` must read predicate fields first, materialize predicate virtual
+columns, evaluate selection, and then read payload fields only for selected
+rows. Position deletes and deletion vectors are represented as `RowVisibility`
+and are applied before payload lazy reads.
 
 ## Schema change contract
 
-`FieldMappingNode` is recursive rather than a flat column map. It represents:
+`FieldMappingNode` is recursive and replaces hidden inherited state. It carries:
 
-- table path to physical path mapping;
-- Iceberg field id and name fallback;
-- missing fields;
-- casts and residual casts;
-- reference-level reads for nested missing fields.
+- table path
+- physical file path
+- Iceberg field id
+- physical Parquet column id range
+- missing/partition/generated/synthesized kind
+- optional cast plan
+- nested children
 
-Nested missing fields use `REFERENCE_LEVELS` or `LEVELS_ONLY` required fields so
-the file reader can read definition/repetition levels from a physical sibling.
-That keeps `array<struct<missing_field>>` cardinality tied to element count
-instead of top-level row count.
+Nested missing fields request `REFERENCE_LEVELS` or `LEVELS_ONLY` so the table
+layer fills them using nested element cardinality, not top-level row count.
 
-## Iceberg delete contract
+## Delete contract
 
-Position deletes and deletion vectors are converted into `RowVisibility` before
-Parquet reads lazy payload columns. Equality delete keys are requested as hidden
-required fields and removed in `IcebergParquetTableReader::finalize_block` after
-delete matching.
+Position deletes and deletion vectors become `RowVisibility`.
 
-The current patch keeps the concrete delete-file reader body as experimental
-follow-up work, but the API boundary already has the necessary data flow.
+Equality delete keys become hidden `RequiredField` entries. `ParquetReader`
+reads them like normal physical columns, and `IcebergTableReader` filters and
+removes them during finalization.
+
+## Compilation status
+
+This is a deliberately non-compilable architecture experiment. The old Parquet
+reader and Iceberg reader bodies were replaced with pseudocode-level APIs so the
+layering is explicit and reviewable without preserving all legacy call sites.

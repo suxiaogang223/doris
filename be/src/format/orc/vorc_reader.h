@@ -172,7 +172,7 @@ public:
     ~OrcReader() override = default;
 
     // Override to build table_info_node from ORC file type using by_orc_name.
-    // Subclasses (HiveOrcReader, IcebergOrcReader) call GenericReader::on_before_init_reader
+    // Subclasses call GenericReader::on_before_init_reader
     // directly, so this OrcReader-level override only applies to plain OrcReader (TVF, load).
     Status on_before_init_reader(ReaderInitContext* ctx) override;
 

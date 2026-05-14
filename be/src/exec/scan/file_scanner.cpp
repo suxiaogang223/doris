@@ -1353,88 +1353,28 @@ Status FileScanner::_get_next_reader() {
     return Status::OK();
 }
 
-Status FileScanner::_init_parquet_reader(FileMetaCache* file_meta_cache_ptr,
-                                         std::unique_ptr<ParquetReader> parquet_reader) {
+Status FileScanner::_init_parquet_reader(FileMetaCache* file_meta_cache_ptr) {
     const TFileRangeDesc& range = _current_range;
     Status init_status = Status::OK();
 
-    phmap::flat_hash_map<int, std::vector<std::shared_ptr<ColumnPredicate>>> slot_id_to_predicates =
-            _local_state
-                    ? _local_state->cast<FileScanLocalState>()._slot_id_to_predicates
-                    : phmap::flat_hash_map<int, std::vector<std::shared_ptr<ColumnPredicate>>> {};
-
-    // Build unified ParquetInitContext (shared by all Parquet reader variants)
-    ParquetInitContext pctx;
-    _fill_base_init_context(&pctx);
-    pctx.conjuncts = &_push_down_conjuncts;
-    pctx.slot_id_to_predicates = &slot_id_to_predicates;
-    pctx.colname_to_slot_id = _col_name_to_slot_id;
-    pctx.not_single_slot_filter_conjuncts = &_not_single_slot_filter_conjuncts;
-    pctx.slot_id_to_filter_conjuncts = &_slot_id_to_filter_conjuncts;
-
     if (range.__isset.table_format_params &&
         range.table_format_params.table_format_type == "iceberg") {
-        // Experimental composition path: IcebergTableReader HAS-A ParquetReader
-        // through a thin GenericReader adapter for FileScanner.
-        std::unique_ptr<IcebergParquetReaderAdapter> iceberg_reader =
-                IcebergParquetReaderAdapter::create_unique(
+        // Experimental split-driven composition path. FileScanner still owns a
+        // GenericReader pointer, but the adapter only bridges the old scanner API.
+        // Iceberg table semantics live in IcebergTableReader; ParquetReader is a
+        // pure FileFormatReader under it.
+        std::unique_ptr<IcebergReaderAdapter> iceberg_reader =
+                std::make_unique<IcebergReaderAdapter>(
                         _kv_cache, _profile, *_params, range, _state->batch_size(),
                         &_state->timezone_obj(), _io_ctx.get(), _state, file_meta_cache_ptr);
-        iceberg_reader->set_create_row_id_column_iterator_func(
-                [this]() -> std::shared_ptr<segment_v2::RowIdColumnIteratorV2> {
-                    return _create_row_id_column_iterator();
-                });
-        init_status = static_cast<GenericReader*>(iceberg_reader.get())->init_reader(&pctx);
+        ReaderInitContext ctx;
+        _fill_base_init_context(&ctx);
+        init_status = static_cast<GenericReader*>(iceberg_reader.get())->init_reader(&ctx);
         _cur_reader = std::move(iceberg_reader);
-    } else if (range.__isset.table_format_params &&
-               range.table_format_params.table_format_type == "paimon") {
-        // PaimonParquetReader IS-A ParquetReader, no wrapping needed
-        auto paimon_reader = PaimonParquetReader::create_unique(
-                _profile, *_params, range, _state->batch_size(), &_state->timezone_obj(), _kv_cache,
-                _io_ctx.get(), _state, file_meta_cache_ptr);
-        init_status = static_cast<GenericReader*>(paimon_reader.get())->init_reader(&pctx);
-        _cur_reader = std::move(paimon_reader);
-    } else if (range.__isset.table_format_params &&
-               range.table_format_params.table_format_type == "hudi") {
-        // HudiParquetReader IS-A ParquetReader, no wrapping needed
-        auto hudi_reader = HudiParquetReader::create_unique(
-                _profile, *_params, range, _state->batch_size(), &_state->timezone_obj(),
-                _io_ctx.get(), _state, file_meta_cache_ptr);
-        init_status = static_cast<GenericReader*>(hudi_reader.get())->init_reader(&pctx);
-        _cur_reader = std::move(hudi_reader);
-    } else if (range.table_format_params.table_format_type == "hive") {
-        auto hive_reader = HiveParquetReader::create_unique(
-                _profile, *_params, range, _state->batch_size(), &_state->timezone_obj(),
-                _io_ctx.get(), _state, &_is_file_slot, file_meta_cache_ptr,
-                _state->query_options().enable_parquet_lazy_mat);
-        hive_reader->set_create_row_id_column_iterator_func(
-                [this]() -> std::shared_ptr<segment_v2::RowIdColumnIteratorV2> {
-                    return _create_row_id_column_iterator();
-                });
-        init_status = static_cast<GenericReader*>(hive_reader.get())->init_reader(&pctx);
-        _cur_reader = std::move(hive_reader);
-    } else if (range.table_format_params.table_format_type == "tvf") {
-        if (!parquet_reader) {
-            parquet_reader = ParquetReader::create_unique(
-                    _profile, *_params, range, _state->batch_size(), &_state->timezone_obj(),
-                    _io_ctx.get(), _state, file_meta_cache_ptr,
-                    _state->query_options().enable_parquet_lazy_mat);
-        }
-        parquet_reader->set_create_row_id_column_iterator_func(
-                [this]() -> std::shared_ptr<segment_v2::RowIdColumnIteratorV2> {
-                    return _create_row_id_column_iterator();
-                });
-        init_status = static_cast<GenericReader*>(parquet_reader.get())->init_reader(&pctx);
-        _cur_reader = std::move(parquet_reader);
-    } else if (_is_load) {
-        if (!parquet_reader) {
-            parquet_reader = ParquetReader::create_unique(
-                    _profile, *_params, range, _state->batch_size(), &_state->timezone_obj(),
-                    _io_ctx.get(), _state, file_meta_cache_ptr,
-                    _state->query_options().enable_parquet_lazy_mat);
-        }
-        init_status = static_cast<GenericReader*>(parquet_reader.get())->init_reader(&pctx);
-        _cur_reader = std::move(parquet_reader);
+    } else {
+        init_status = Status::NotSupported(
+                "ParquetReader was replaced by the split-driven FileFormatReader experiment. "
+                "Only the Iceberg + Parquet composition path is modeled in this branch.");
     }
 
     return init_status;
@@ -1467,17 +1407,10 @@ Status FileScanner::_init_orc_reader(FileMetaCache* file_meta_cache_ptr,
         _cur_reader = std::move(tran_orc_reader);
     } else if (range.__isset.table_format_params &&
                range.table_format_params.table_format_type == "iceberg") {
-        // IcebergOrcReader IS-A OrcReader (CRTP mixin), no wrapping needed
-        std::unique_ptr<IcebergOrcReader> iceberg_reader = IcebergOrcReader::create_unique(
-                _kv_cache, _profile, _state, *_params, range, _state->batch_size(),
-                _state->timezone(), _io_ctx.get(), file_meta_cache_ptr);
-        iceberg_reader->set_create_row_id_column_iterator_func(
-                [this]() -> std::shared_ptr<segment_v2::RowIdColumnIteratorV2> {
-                    return _create_row_id_column_iterator();
-                });
-        init_status = static_cast<GenericReader*>(iceberg_reader.get())->init_reader(&octx);
-
-        _cur_reader = std::move(iceberg_reader);
+        init_status = Status::NotSupported(
+                "Iceberg ORC still needs an OrcReader FileFormatReader implementation. "
+                "This experiment removed the inherited Iceberg ORC path and only models "
+                "IcebergTableReader + ParquetReader composition.");
     } else if (range.__isset.table_format_params &&
                range.table_format_params.table_format_type == "paimon") {
         // PaimonOrcReader IS-A OrcReader, no wrapping needed
@@ -1627,16 +1560,10 @@ Status FileScanner::read_lines_from_range(const TFileRangeDesc& range,
             [&]() -> Status {
                 switch (format_type) {
                 case TFileFormatType::FORMAT_PARQUET: {
-                    std::unique_ptr<ParquetReader> parquet_reader = ParquetReader::create_unique(
-                            _profile, *_params, range, 1, &_state->timezone_obj(), _io_ctx.get(),
-                            _state, file_meta_cache_ptr, false);
-                    RETURN_IF_ERROR(
-                            _init_parquet_reader(file_meta_cache_ptr, std::move(parquet_reader)));
-                    // _init_parquet_reader may create a new table-format specific reader
-                    // (e.g., HiveParquetReader) that replaces the original parquet_reader.
-                    // We need to re-apply read_by_rows to the actual _cur_reader.
-                    RETURN_IF_ERROR(_cur_reader->read_by_rows(row_ids));
-                    break;
+                    return Status::NotSupported(
+                            "read_lines_from_range still uses the old GenericReader random-row "
+                            "contract. It is intentionally not modeled in the composition "
+                            "experiment.");
                 }
                 case TFileFormatType::FORMAT_ORC: {
                     std::unique_ptr<OrcReader> orc_reader = OrcReader::create_unique(
