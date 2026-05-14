@@ -60,6 +60,7 @@ struct IcebergDeletePlan {
 struct IcebergTableReaderScanState final : public TableReaderScanState {
     IcebergSplitContext split;
     IcebergDeletePlan delete_plan;
+    TableColumnMapping column_mapping;
     FieldMappingNode mapping;
     std::vector<RequiredField> required_fields;
     VirtualColumnPlan virtual_columns;
@@ -80,6 +81,8 @@ private:
     Status _create_file_reader(IcebergTableReaderScanState* state);
     Status _build_schema_mapping(const PhysicalFileSchema& physical_schema,
                                  IcebergTableReaderScanState* state);
+    std::vector<TableColumnDefinition> _build_table_column_definitions(
+            IcebergTableReaderScanState* state);
     Status _build_delete_plan(IcebergTableReaderScanState* state);
     Status _build_required_fields(IcebergTableReaderScanState* state);
     Status _build_virtual_column_plan(IcebergTableReaderScanState* state);

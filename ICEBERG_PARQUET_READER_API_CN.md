@@ -27,6 +27,7 @@ Doris 中对应关系是：
 ```text
 DuckDB MultiFileReader        -> Doris TableReader
 DuckDB BaseFileReader         -> Doris BaseFileFormatReader
+DuckDB MultiFileColumnMapper  -> Doris TableColumnMapper
 DuckDB ParquetReaderScanState -> Doris FormatReaderScanState / ParquetScanState
 DuckDB ColumnReader           -> Doris ColumnReader API
 ```
@@ -88,6 +89,26 @@ close()
 - position delete / deletion vector 到 `RowVisibility`
 - `$row_id`、`_row_id`、`_last_updated_sequence_number`
 - residual predicate 和 final projection
+
+### `TableColumnMapper`
+
+`TableColumnMapper` 对应 DuckDB `MultiFileColumnMapper`，是 schema change 的核心
+中间层。
+
+相关类型：
+
+- `TableColumnDefinition`：描述一棵表列或文件列 schema，包含 name、type、children、
+  field id、name identifier、default value。
+- `TableColumnMapping`：一次文件扫描的 mapping 结果，记录 mapping mode、每个表列到
+  文件列的映射，以及转换后的递归 `FieldMappingNode`。
+- `TableColumnMappingNode`：单列 mapping 结果，表达 physical/missing/default/cast、
+  global ordinal、local ordinal、nested child mapping、是否需要 definition/repetition
+  levels。
+
+Iceberg 表 schema 先被转换成 global `TableColumnDefinition`，Parquet footer schema
+被转换成 local `TableColumnDefinition`。`TableColumnMapper` 再按 field id 优先、
+name fallback 生成 `TableColumnMapping`。`FieldMappingNode` 不再直接承担 field-id
+匹配职责，而是作为 mapper 输出后给 `ParquetReader` / `ColumnReader` 使用的递归读计划。
 
 ### `FileFormatReader`
 
@@ -280,7 +301,8 @@ rows 的 payload fields 执行 `ColumnReader::select`。如果 selection 为空�
 
 `PhysicalFileSchema` 是纯 Parquet 物理 schema。
 
-`FieldMappingNode` 是 Iceberg table schema 到 physical schema 的递归映射，支持：
+`TableColumnMapper` 先把 Iceberg table schema 和 Parquet file schema 做递归映射，
+生成 `TableColumnMapping`，支持：
 
 - field id 匹配
 - name fallback
@@ -288,6 +310,9 @@ rows 的 payload fields 执行 `ColumnReader::select`。如果 selection 为空�
 - missing
 - nested missing
 - cast plan
+
+`FieldMappingNode` 是 `TableColumnMapping` 的派生结果，作为文件层递归 reader tree 的
+输入。
 
 ### nested missing
 

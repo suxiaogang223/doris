@@ -102,30 +102,34 @@ Status IcebergTableReader::_create_file_reader(IcebergTableReaderScanState* stat
 Status IcebergTableReader::_build_schema_mapping(const PhysicalFileSchema& physical_schema,
                                                  IcebergTableReaderScanState* state) {
     DORIS_CHECK(state->task.options.tuple_descriptor != nullptr);
-    state->mapping = FieldMappingNode {};
-    state->mapping.table_path = "$root";
-    state->mapping.file_path = "$root";
-    state->mapping.kind = FieldMappingKind::PHYSICAL;
-
-    // Pseudocode:
-    // For each output/predicate/delete slot:
-    //   1. Match by Iceberg field id against physical_schema.
-    //   2. If the file lacks ids, fallback to historical name matching.
-    //   3. Missing fields become FieldMappingKind::MISSING.
-    //   4. Struct/list/map recurse and attach reference-level requirements.
-    //   5. Safe casts are marked for file-level pushdown; unsafe casts become
-    //      residual predicates in IcebergTableReader.
-    for (const auto* slot : state->task.options.tuple_descriptor->slots()) {
-        FieldMappingNode child;
-        child.table_path = slot->col_name();
-        child.file_path = slot->col_name();
-        child.table_field_id = slot->col_unique_id();
-        child.kind = FieldMappingKind::PHYSICAL;
-        child.cast_plan = CastPlan {slot->get_data_type_ptr(), slot->get_data_type_ptr(),
-                                    CastSafety::SAFE_FOR_PUSHDOWN};
-        state->mapping.children.push_back(std::move(child));
-    }
+    auto table_columns = _build_table_column_definitions(state);
+    auto mapping_mode = physical_schema.has_field_ids ? TableColumnMappingMode::BY_FIELD_ID
+                                                      : TableColumnMappingMode::BY_NAME;
+    TableColumnMapper mapper(mapping_mode, std::move(table_columns), physical_schema.columns);
+    state->column_mapping = mapper.build_mapping();
+    state->mapping = state->column_mapping.mapping_root;
     return Status::OK();
+}
+
+std::vector<TableColumnDefinition> IcebergTableReader::_build_table_column_definitions(
+        IcebergTableReaderScanState* state) {
+    std::vector<TableColumnDefinition> columns;
+    // Pseudocode:
+    // Build global table columns from Iceberg table schema, not from Parquet.
+    // The tuple descriptor is a convenient placeholder in this experiment:
+    //   - name/type come from output slots
+    //   - field_id comes from Iceberg field id when available
+    //   - default_value comes from Iceberg initial/default values
+    //   - nested struct/list/map children are expanded recursively
+    for (const auto* slot : state->task.options.tuple_descriptor->slots()) {
+        TableColumnDefinition column;
+        column.name = slot->col_name();
+        column.type = slot->get_data_type_ptr();
+        column.field_id = slot->col_unique_id();
+        column.identifier_name = slot->col_name();
+        columns.push_back(std::move(column));
+    }
+    return columns;
 }
 
 Status IcebergTableReader::_build_delete_plan(IcebergTableReaderScanState* state) {
@@ -209,6 +213,7 @@ Status IcebergTableReader::_configure_file_reader(const TableReaderScanTask& tas
                                                   IcebergTableReaderScanState* state) {
     auto& properties = state->file_reader->scan_properties;
     properties.schema_mapping_root = state->mapping;
+    properties.column_mapping = state->column_mapping;
     properties.required_fields = state->required_fields;
     properties.row_visibility = state->delete_plan.row_visibility;
     properties.virtual_columns = state->virtual_columns;

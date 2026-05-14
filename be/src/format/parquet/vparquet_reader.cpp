@@ -81,6 +81,13 @@ Status ParquetReader::_open_footer() {
     _footer.schema.root.table_path = "$root";
     _footer.schema.root.file_path = "$root";
     _footer.schema.root.kind = FieldMappingKind::PHYSICAL;
+    _footer.schema.columns.clear();
+    // Pseudocode:
+    // Parse every top-level Parquet schema element into a TableColumnDefinition.
+    // For nested struct/list/map fields, recursively fill children. If Parquet
+    // field_id metadata exists, put it in field_id so TableColumnMapper can do
+    // BY_FIELD_ID matching. Historical files without ids leave field_id empty
+    // and IcebergTableReader falls back to BY_NAME.
     _footer.schema.has_field_ids = true;
     _footer.total_rows = 0;
     _footer.row_group_first_rows.clear();

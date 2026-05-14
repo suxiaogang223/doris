@@ -13,6 +13,7 @@ The BE reader boundary is one split, but the API role still mirrors DuckDB:
 
 - DuckDB `MultiFileReader` -> Doris `TableReader`
 - DuckDB `BaseFileReader` -> Doris `BaseFileFormatReader`
+- DuckDB `MultiFileColumnMapper` -> Doris `TableColumnMapper`
 - DuckDB `ParquetReaderScanState` -> Doris `ParquetScanState`
 
 ## Runtime stack
@@ -58,9 +59,10 @@ page decoding, level reads, filter/select/skip and prefetch.
 Reader objects hold file/table metadata. Scan state objects hold mutable scan
 cursors.
 
-`IcebergTableReaderScanState` owns the split context, schema mapping, delete
-plan, required fields, virtual column plan, the selected `FileFormatReader` and
-its `FormatReaderScanState`. The file read plan is configured on
+`IcebergTableReaderScanState` owns the split context, `TableColumnMapping`,
+derived `FieldMappingNode`, delete plan, required fields, virtual column plan,
+the selected `FileFormatReader` and its `FormatReaderScanState`. The file read
+plan is configured on
 `BaseFileFormatReader::scan_properties`, mirroring DuckDB's `BaseFileReader`
 members instead of using a separate task object.
 
@@ -103,7 +105,21 @@ not side-channel batch fields.
 
 ## Schema change contract
 
-`FieldMappingNode` is recursive and replaces hidden inherited state. It carries:
+`TableColumnMapper` mirrors DuckDB's `MultiFileColumnMapper`. It maps global
+table columns to local file columns before the physical reader is configured:
+
+- `TableColumnDefinition` describes both global table columns and local file
+  columns with name, type, children, field id, identifier name and default value.
+- `TableColumnMapping` stores one file's mapping mode and mapping result.
+- `TableColumnMappingNode` records physical/missing/default/cast status,
+  global/local ordinal, nested child mapping and whether levels are required.
+
+Iceberg produces global `TableColumnDefinition` from table schema. Parquet
+produces local `TableColumnDefinition` from footer schema. Mapping is BY_FIELD_ID
+when Parquet field ids are present and BY_NAME for historical files without ids.
+
+`FieldMappingNode` is derived from `TableColumnMapping` and is the recursive
+reader-tree input. It carries:
 
 - table path
 - physical file path
