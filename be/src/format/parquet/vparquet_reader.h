@@ -79,7 +79,7 @@ struct ParquetScanState final : public FormatReaderScanState {
     //   scan_filters: predicate fields with per-filter state
 };
 
-class ParquetReader final : public FileFormatReader {
+class ParquetReader final : public BaseFileFormatReader {
 public:
     ParquetReader(RuntimeProfile* profile, const TFileScanRangeParams& params,
                   const TFileRangeDesc& range, size_t batch_size, const cctz::time_zone* ctz,

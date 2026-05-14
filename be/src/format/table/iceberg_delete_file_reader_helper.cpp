@@ -98,9 +98,9 @@ Status read_iceberg_position_delete_file(const TIcebergDeleteFileDesc& delete_fi
     // Pseudocode for the composition rewrite:
     //
     // IcebergTableReader::_build_delete_plan owns position delete planning. It
-    // should instantiate a FileFormatReader for the delete file format
-    // (ParquetReader today, OrcReader-as-FileFormatReader later), configure
-    // FileFormatReader::scan_properties with required fields:
+    // should instantiate a BaseFileFormatReader for the delete file format
+    // (ParquetReader today, OrcReader-as-BaseFileFormatReader later), configure
+    // BaseFileFormatReader::scan_properties with required fields:
     //   - file_path as hidden delete metadata
     //   - pos as hidden delete metadata
     // and stream those rows into RowVisibility::deleted_rows for the current
@@ -111,7 +111,7 @@ Status read_iceberg_position_delete_file(const TIcebergDeleteFileDesc& delete_fi
     // ParquetReader/OrcReader GenericReader implementations.
     return Status::NotSupported(
             "Position delete file reading is now modeled inside IcebergTableReader delete "
-            "planning with FileFormatReader composition. delete_file={}",
+            "planning with BaseFileFormatReader composition. delete_file={}",
             delete_file.path);
 }
 

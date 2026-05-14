@@ -9,7 +9,7 @@ Therefore the BE reader boundary is one split, but the API role still mirrors
 DuckDB:
 
 - DuckDB `MultiFileReader` -> Doris `TableReader`
-- DuckDB `BaseFileReader` -> Doris `FileFormatReader`
+- DuckDB `BaseFileReader` -> Doris `BaseFileFormatReader`
 - DuckDB `ParquetReaderScanState` -> Doris `ParquetScanState`
 
 ## Runtime stack
@@ -20,7 +20,8 @@ FileScanner
     TableReader
       IcebergTableReader            // table-format semantics for one split
       FileFormatReader
-        ParquetReader               // physical Parquet split reader
+        BaseFileFormatReader        // common file-format fields
+          ParquetReader             // physical Parquet split reader
           ParquetScanState
           ColumnReader API          // column/page/level decoding boundary
 ```
@@ -57,7 +58,7 @@ cursors.
 `IcebergTableReaderScanState` owns the split context, schema mapping, delete
 plan, required fields, virtual column plan, the selected `FileFormatReader` and
 its `FormatReaderScanState`. The file read plan is configured on
-`FileFormatReader::scan_properties`, mirroring DuckDB's `BaseFileReader`
+`BaseFileFormatReader::scan_properties`, mirroring DuckDB's `BaseFileReader`
 members instead of using a separate task object.
 
 `ParquetScanState` owns row-group cursor state, selection, lazy read plan,
@@ -65,9 +66,13 @@ output template, and pseudocode placeholders for the recursive `ColumnReader`
 tree plus definition/repetition level buffers. This follows DuckDB's
 `ParquetReaderScanState` shape.
 
+`FileFormatReader` is a narrow interface. `BaseFileFormatReader` carries common
+fields shared by physical formats: file path, split range, read context and
+`scan_properties`.
+
 ## Lazy materialization contract
 
-`FileFormatReader::scan_properties.required_fields` classifies fields by purpose:
+`BaseFileFormatReader::scan_properties.required_fields` classifies fields by purpose:
 
 - `PREDICATE`
 - `OUTPUT`

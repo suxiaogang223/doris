@@ -63,7 +63,7 @@ struct IcebergTableReaderScanState final : public TableReaderScanState {
     FieldMappingNode mapping;
     std::vector<RequiredField> required_fields;
     VirtualColumnPlan virtual_columns;
-    std::unique_ptr<FileFormatReader> file_reader;
+    std::unique_ptr<BaseFileFormatReader> file_reader;
 };
 
 class IcebergTableReader final : public TableReader {

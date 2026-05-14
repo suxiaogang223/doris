@@ -43,7 +43,7 @@ class TupleDescriptor;
 // This file intentionally mirrors DuckDB's reader split while using Doris names:
 //
 //   DuckDB MultiFileReader      -> Doris TableReader
-//   DuckDB BaseFileReader       -> Doris FileFormatReader
+//   DuckDB BaseFileReader       -> Doris BaseFileFormatReader
 //   DuckDB ParquetReaderScanState -> Doris FormatReaderScanState subclasses
 //
 // Doris BE does not enumerate files. FE already resolves table snapshots,
@@ -171,16 +171,12 @@ struct PhysicalFileSchema {
 };
 
 struct FileFormatScanProperties {
-    std::string path;
-    int64_t split_start = 0;
-    int64_t split_size = -1;
     FieldMappingNode schema_mapping_root;
     std::vector<RequiredField> required_fields;
     FormatPredicatePlan predicates;
     RowVisibility row_visibility;
     VirtualColumnPlan virtual_columns;
     bool need_row_positions = false;
-    FileReadContext read_context;
     Block physical_read_template;
 };
 
@@ -224,13 +220,28 @@ class FileFormatReader {
 public:
     virtual ~FileFormatReader() = default;
 
-    FileFormatScanProperties scan_properties;
-
     virtual Status open() = 0;
     virtual const PhysicalFileSchema& physical_schema() const = 0;
     virtual Status initialize_scan(FormatReaderScanState* state) = 0;
     virtual Status scan(FormatReaderScanState* state, PhysicalReadBatch* batch, bool* eof) = 0;
     virtual Status close() = 0;
+};
+
+class BaseFileFormatReader : public FileFormatReader {
+public:
+    BaseFileFormatReader(std::string path, int64_t split_start, int64_t split_size,
+                         FileReadContext read_context)
+            : file_path(std::move(path)),
+              split_start(split_start),
+              split_size(split_size),
+              read_context(read_context) {}
+    ~BaseFileFormatReader() override = default;
+
+    const std::string file_path;
+    const int64_t split_start = 0;
+    const int64_t split_size = -1;
+    FileReadContext read_context;
+    FileFormatScanProperties scan_properties;
 };
 
 struct TableReaderOptions {

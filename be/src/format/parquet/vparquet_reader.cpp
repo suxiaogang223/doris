@@ -26,7 +26,9 @@ ParquetReader::ParquetReader(RuntimeProfile* profile, const TFileScanRangeParams
                              const TFileRangeDesc& range, size_t batch_size,
                              const cctz::time_zone* ctz, io::IOContext* io_ctx, RuntimeState* state,
                              FileMetaCache* meta_cache)
-        : _profile(profile),
+        : BaseFileFormatReader(range.path, range.start_offset, range.size,
+                               FileReadContext {nullptr, state, profile}),
+          _profile(profile),
           _params(params),
           _range(range),
           _batch_size(std::max<size_t>(batch_size, 1)),
@@ -77,7 +79,7 @@ Status ParquetReader::_open_footer() {
     }
 
     // Pseudocode:
-    // 1. Open _range.path through FileFactory and Doris IOContext.
+    // 1. Open file_path through FileFactory and Doris IOContext.
     // 2. Read Parquet footer, row group metadata, page index and column chunks.
     // 3. Build a recursive PhysicalFileSchema with schema index, column index,
     //    field id, max definition level and max repetition level.

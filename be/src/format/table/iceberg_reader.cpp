@@ -106,8 +106,8 @@ Status IcebergTableReader::_load_split_context(IcebergTableReaderScanState* stat
 
 Status IcebergTableReader::_create_file_reader(IcebergTableReaderScanState* state) {
     // Pseudocode:
-    // Choose FileFormatReader from _range.format_type. This experiment wires
-    // only Parquet; ORC/CSV later implement the same FileFormatReader API.
+    // Choose BaseFileFormatReader from _range.format_type. This experiment
+    // wires only Parquet; ORC/CSV later implement the same base API.
     state->file_reader = std::make_unique<ParquetReader>(_profile, _params, _range, _batch_size,
                                                          _ctz, _io_ctx, _state, _meta_cache);
     return Status::OK();
@@ -222,14 +222,10 @@ Status IcebergTableReader::_build_virtual_column_plan(IcebergTableReaderScanStat
 Status IcebergTableReader::_configure_file_reader(const TableReaderScanTask& task,
                                                   IcebergTableReaderScanState* state) {
     auto& properties = state->file_reader->scan_properties;
-    properties.path = _range.path;
-    properties.split_start = _range.start_offset;
-    properties.split_size = _range.size;
     properties.schema_mapping_root = state->mapping;
     properties.required_fields = state->required_fields;
     properties.row_visibility = state->delete_plan.row_visibility;
     properties.virtual_columns = state->virtual_columns;
-    properties.read_context = task.options.read_context;
     properties.physical_read_template = Block(task.options.tuple_descriptor->slots(), 0);
 
     properties.need_row_positions = properties.row_visibility.needs_row_positions();

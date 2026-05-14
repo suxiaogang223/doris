@@ -24,7 +24,7 @@ Doris 中对应关系是：
 
 ```text
 DuckDB MultiFileReader        -> Doris TableReader
-DuckDB BaseFileReader         -> Doris FileFormatReader
+DuckDB BaseFileReader         -> Doris BaseFileFormatReader
 DuckDB ParquetReaderScanState -> Doris FormatReaderScanState / ParquetScanState
 DuckDB ColumnReader           -> Doris ColumnReader API
 ```
@@ -37,7 +37,8 @@ FileScanner
     TableReader
       IcebergTableReader
         FileFormatReader
-          ParquetReader
+          BaseFileFormatReader
+            ParquetReader
             ParquetScanState
             ColumnReader tree
 ```
@@ -88,9 +89,9 @@ close()
 
 ### `FileFormatReader`
 
-`FileFormatReader` 对应 DuckDB 的 `BaseFileReader`。
+`FileFormatReader` 是文件格式 reader 的纯接口。
 
-它只负责物理文件格式，不理解 Iceberg/Hive/Hudi/Paimon 表语义。
+它只定义物理文件格式 reader 的生命周期，不放公共字段。
 
 接口：
 
@@ -102,13 +103,25 @@ scan(FormatReaderScanState*, PhysicalReadBatch*, bool*)
 close()
 ```
 
-和 DuckDB `BaseFileReader` 一样，文件层读计划不是额外 task 对象，而是
-`FileFormatReader::scan_properties` 上的成员配置，例如 schema mapping、
-required fields、row visibility、virtual columns、split range。
+### `BaseFileFormatReader`
+
+`BaseFileFormatReader` 对应 DuckDB 的 `BaseFileReader`。
+
+它承载所有文件格式 reader 都需要的公共字段：
+
+- `file_path`
+- `split_start`
+- `split_size`
+- `read_context`
+- `scan_properties`
+
+和 DuckDB `BaseFileReader` 一样，文件层读计划不是额外 task 对象，而是 base reader
+上的成员配置。`scan_properties` 保存 schema mapping、required fields、row visibility、
+virtual columns 等由 `TableReader` 下发给文件层的计划。
 
 ### `ParquetReader`
 
-`ParquetReader` 是 `FileFormatReader` 的 Parquet 实现。
+`ParquetReader` 是 `BaseFileFormatReader` 的 Parquet 实现。
 
 它负责：
 
@@ -202,7 +215,7 @@ Parquet 的具体文件层状态，对应 DuckDB `ParquetReaderScanState`。
 5. 构造 `IcebergDeletePlan`
 6. 构造 `RequiredField`
 7. 构造 `VirtualColumnPlan`
-8. 配置 `FileFormatReader::scan_properties`
+8. 配置 `BaseFileFormatReader::scan_properties`
 9. 创建 `ParquetScanState`
 10. 调用 `ParquetReader::initialize_scan`
 
@@ -271,7 +284,7 @@ equality delete key 被加入 hidden `RequiredField`。`ParquetReader` 像读普
 
 ### row id / lineage
 
-`FileFormatReader::scan_properties.need_row_positions` 要求文件层返回 `row_positions`。`IcebergTableReader`
+`BaseFileFormatReader::scan_properties.need_row_positions` 要求文件层返回 `row_positions`。`IcebergTableReader`
 结合 split metadata 生成 `$row_id`、`_row_id`、
 `_last_updated_sequence_number`。
 
@@ -289,6 +302,6 @@ equality delete key 被加入 hidden `RequiredField`。`ParquetReader` 像读普
 
 - Doris 版 `TableReader` 对应 DuckDB `MultiFileReader` 的编排职责
 - `IcebergTableReader` 是 `TableReader` 子类
-- `ParquetReader` 是纯物理 `FileFormatReader`
+- `ParquetReader` 是纯物理 `BaseFileFormatReader`
 - scan cursor 和 reader 元信息分离
 - 延时物化、schema change、delete、row id 可以通过新 API 承载
