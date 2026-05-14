@@ -123,8 +123,8 @@ public:
         // 伪逻辑：
         // 1. 打开 task.data_file 对应的 Parquet 文件；
         // 2. 从 ParquetReader 获取 file-local columns；
-        // 3. 在 IcebergTableReader 内部创建 field-id mapping；
-        // 4. 将 table filters localize 成 ParquetScanRequest::local_filters；
+        // 3. 使用 TableColumnMapper 创建 field-id mapping；
+        // 4. 将 table projection/filter 转成 ParquetScanRequest；
         // 5. 将无法本地化的 filter 放入 reader_expression_map；
         // 6. 将 position deletes 合并到 ParquetScanRequest；
         // 7. 调用 ParquetReader::init_reader。
@@ -134,8 +134,11 @@ public:
         if (_data_reader) {
             RETURN_IF_ERROR(_data_reader->get_columns(&file_columns));
         }
-        RETURN_IF_ERROR(create_mapping(_iceberg_schema, file_columns, &_mappings));
-        RETURN_IF_ERROR(localize_filters(_table_scan_request.table_filters, _mappings, &parquet_request));
+        reader::TableColumnMapperOptions mapper_options;
+        mapper_options.mode = reader::TableColumnMappingMode::BY_FIELD_ID;
+        _column_mapper = reader::TableColumnMapper(mapper_options);
+        RETURN_IF_ERROR(_column_mapper.create_mapping(_iceberg_schema, file_columns, &_mappings));
+        RETURN_IF_ERROR(_column_mapper.create_scan_request(_table_scan_request, &parquet_request));
         RETURN_IF_ERROR(apply_position_deletes(&parquet_request));
         if (_data_reader) {
             RETURN_IF_ERROR(_data_reader->init_reader(parquet_request));
@@ -216,62 +219,8 @@ private:
     reader::TableScanRequest _table_scan_request;
     std::vector<reader::TableColumn> _iceberg_schema;
     std::vector<reader::ColumnMapping> _mappings;
+    reader::TableColumnMapper _column_mapper;
     std::unique_ptr<parquet::ParquetReader> _data_reader;
-
-private:
-    Status create_mapping(const std::vector<reader::TableColumn>& iceberg_schema,
-                          const std::vector<parquet::ParquetFileColumn>& file_columns,
-                          std::vector<reader::ColumnMapping>* mappings) {
-        // IcebergTableReader 内部的 mapping 流程，对齐 DuckDB：
-        // mapping 是 reader 初始化的一部分，不作为公开 ColumnMapper API 暴露。
-        //
-        // 伪逻辑：
-        // 1. 优先按 Iceberg field id 匹配 table column 和 parquet file column；
-        // 2. 文件缺失列生成 default/partition/generated finalize_expr；
-        // 3. 类型不同但可转换时生成 cast finalize_expr；
-        // 4. 类型不同且 filter 不能直接下推时生成 reader_filter_expr。
-        mappings->clear();
-        for (const auto& table_column : iceberg_schema) {
-            reader::ColumnMapping mapping;
-            mapping.table_column_id = table_column.id;
-            mapping.table_type = table_column.type;
-            for (const auto& file_column : file_columns) {
-                if (file_column.id == table_column.id) {
-                    mapping.file_column_id = file_column.id;
-                    mapping.file_type = file_column.type;
-                    break;
-                }
-            }
-            mappings->push_back(mapping);
-        }
-        return Status::OK();
-    }
-
-    Status localize_filters(const std::vector<reader::TableFilter>& table_filters,
-                            const std::vector<reader::ColumnMapping>& mappings,
-                            parquet::ParquetScanRequest* request) {
-        // IcebergTableReader 内部的 filter localization。
-        // table filter 只在这里翻译成 ParquetLocalFilter，ParquetReader 不理解 table filter。
-        //
-        // 伪逻辑：
-        // 1. trivial mapping: 直接生成 ParquetLocalFilter；
-        // 2. safe cast: 将 filter 常量 cast 到文件类型后生成 ParquetLocalFilter；
-        // 3. unsafe cast/generated expr: 放入 reader_expression_map 或保留到 finalize 阶段。
-        for (const auto& filter : table_filters) {
-            for (const auto& mapping : mappings) {
-                if (mapping.table_column_id != filter.table_column_id || !mapping.file_column_id) {
-                    continue;
-                }
-                parquet::ParquetLocalFilter local_filter;
-                local_filter.file_column_id = *mapping.file_column_id;
-                local_filter.conjunct = filter.conjunct;
-                local_filter.predicates = filter.predicates;
-                request->local_filters.push_back(local_filter);
-                break;
-            }
-        }
-        return Status::OK();
-    }
 };
 
 } // namespace doris::iceberg

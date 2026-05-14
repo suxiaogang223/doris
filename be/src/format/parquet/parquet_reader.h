@@ -82,6 +82,7 @@ struct ParquetFileColumn {
     std::string name;
     DataTypePtr type;
     const FieldSchema* field = nullptr;
+    std::vector<ParquetFileColumn> children;
 };
 
 // 文件层可直接下推的过滤条件。

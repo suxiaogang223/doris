@@ -17,6 +17,10 @@ MultiFileReader/TableReader
   负责 table/global schema mapping
   执行 cast/default/remap/generated column expressions
   输出最终 table block
+
+MultiFileColumnMapper
+  负责 global column 到 file-local column 的映射
+  负责 filter localization 和无法安全下推时的 expression fallback
 ```
 
 Doris 当前的 Parquet reader 重构也面临同一个问题：底层 Parquet reader 应该
@@ -75,6 +79,31 @@ public:
     virtual Status close() = 0;
 };
 ```
+
+### TableColumnMapper
+
+`TableColumnMapper` 定义在：
+
+```text
+be/src/format/reader/table_reader.h
+```
+
+它对应 DuckDB 的 `MultiFileColumnMapper`，是 table/global schema 与 file-local
+schema 之间的通用映射组件，不是 Iceberg 专用类。
+
+职责：
+
+- 支持 `BY_FIELD_ID` 和 `BY_NAME` 两种映射模式；
+- 生成 table column 到 file column 的 `ColumnMapping`；
+- 处理 missing/default/partition/generated column 的 finalize 表达式；
+- 对 struct/list/map 等复杂列递归建立 child mapping；
+- 将 table-level filter 转成 `ParquetLocalFilter`；
+- 对不能安全本地化的 filter 生成 `reader_expression_map`；
+- 让 `ParquetReader` 只看到 file-local projection/filter，不理解 global schema。
+
+Iceberg 使用时，`IcebergTableReader` 只负责把 mapper 配成
+`TableColumnMappingMode::BY_FIELD_ID`。后续 Hive/普通 multi-file Parquet 可以用
+`BY_NAME`。
 
 ### ParquetReader
 
@@ -283,13 +312,14 @@ public:
 ```
 
 Parquet 命名空间只保留文件物理读取 API。Iceberg/global schema、table column
-mapping、finalize expression 都归属于 `IcebergTableReader`。
+mapping、finalize expression 都归属于 table reader 层，其中通用 mapping 逻辑由
+`TableColumnMapper` 承接。
 
 ## Filter 处理策略
 
-Table-level filters 先进入 `IcebergTableReader` 内部 mapping/localization 流程。
-`IcebergTableReader` 基于 Iceberg field id 找到对应的 file-local column，再把
-可以安全下推的谓词交给 `ParquetReader`。
+Table-level filters 先进入 `TableColumnMapper` 的 mapping/localization 流程。
+Iceberg 场景下，`IcebergTableReader` 使用 `BY_FIELD_ID` mapper 找到对应的
+file-local column，再把可以安全下推的谓词交给 `ParquetReader`。
 
 路径一：trivial mapping。
 
@@ -334,7 +364,7 @@ DuckDB BaseFileReader
   -> Doris ParquetReader
 
 DuckDB MultiFileColumnMapper
-  -> Doris IcebergTableReader 内部 column mapping 流程
+  -> Doris TableColumnMapper
 
 DuckDB MultiFileReader::FinalizeChunk
   -> Doris IcebergTableReader::finalize_chunk
@@ -354,6 +384,7 @@ DuckDB IcebergMultiFileReader
 - 保留 decoder、schema、metadata、bloom filter、page index 等可复用模块；
 - 新增 `parquet_reader.h`；
 - 新增 `format/reader/table_reader.h`；
+- 新增 `TableColumnMapper` API；
 - 新增组合式 `IcebergTableReader` API；
 - 明确 `ParquetReader` 和 `IcebergTableReader` 边界。
 
@@ -365,7 +396,7 @@ DuckDB IcebergMultiFileReader
 
 ### Phase 3: IcebergTableReader 实现
 
-- 迁移 Iceberg schema mapping；
+- 使用 `TableColumnMapper(BY_FIELD_ID)` 迁移 Iceberg schema mapping；
 - 实现 missing/default/partition/generated columns；
 - 实现 finalize expressions。
 
