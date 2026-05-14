@@ -27,20 +27,7 @@ constexpr const char* ROW_LINEAGE_ROW_ID = "_row_id";
 constexpr const char* ROW_LINEAGE_LAST_UPDATED_SEQUENCE_NUMBER = "_last_updated_sequence_number";
 } // namespace
 
-IcebergTableReader::IcebergTableReader(ShardedKVCache* kv_cache, RuntimeProfile* profile,
-                                       const TFileScanRangeParams& params,
-                                       const TFileRangeDesc& range, size_t batch_size,
-                                       const cctz::time_zone* ctz, io::IOContext* io_ctx,
-                                       RuntimeState* state, FileMetaCache* meta_cache)
-        : _kv_cache(kv_cache),
-          _profile(profile),
-          _params(params),
-          _range(range),
-          _batch_size(batch_size),
-          _ctz(ctz),
-          _io_ctx(io_ctx),
-          _state(state),
-          _meta_cache(meta_cache) {}
+IcebergTableReader::IcebergTableReader(ShardedKVCache* kv_cache) : _kv_cache(kv_cache) {}
 
 Status IcebergTableReader::initialize_scan(const TableReaderScanTask& task,
                                            TableReaderScanState* state) {
@@ -92,10 +79,10 @@ Status IcebergTableReader::close() {
 
 Status IcebergTableReader::_load_split_context(IcebergTableReaderScanState* state) {
     // Pseudocode:
-    // Doris BE receives one FE-planned TFileRangeDesc. FE has already resolved
-    // Iceberg snapshot, manifests, file enumeration and split assignment. This
-    // method extracts per-split table metadata only.
-    state->split.data_file_path = _range.path;
+    // Doris BE receives one FE-planned split. FE has already resolved Iceberg
+    // snapshot, manifests, file enumeration and split assignment. The adapter
+    // extracts thrift data into TableReaderSplit before this reader sees it.
+    state->split.data_file_path = state->task.split.data_file.path;
     state->split.partition_spec_id = 0;
     state->split.partition_data_json.clear();
     state->split.first_row_id = -1;
@@ -105,10 +92,10 @@ Status IcebergTableReader::_load_split_context(IcebergTableReaderScanState* stat
 
 Status IcebergTableReader::_create_file_reader(IcebergTableReaderScanState* state) {
     // Pseudocode:
-    // Choose BaseFileFormatReader from _range.format_type. This experiment
-    // wires only Parquet; ORC/CSV later implement the same base API.
-    state->file_reader = std::make_unique<ParquetReader>(_profile, _params, _range, _batch_size,
-                                                         _ctz, _io_ctx, _state, _meta_cache);
+    // Choose BaseFileFormatReader from task.split.data_file.format. This
+    // experiment wires only Parquet; ORC/CSV later implement the same base API.
+    state->file_reader = std::make_unique<ParquetReader>(state->task.split.data_file,
+                                                         state->task.options.runtime_options);
     return Status::OK();
 }
 
@@ -295,24 +282,50 @@ Status IcebergTableReader::_project_final_block(IcebergTableReaderScanState* sta
 }
 
 IcebergReaderAdapter::IcebergReaderAdapter(ShardedKVCache* kv_cache, RuntimeProfile* profile,
-                                           const TFileScanRangeParams& params,
+                                           const TFileScanRangeParams& /*params*/,
                                            const TFileRangeDesc& range, size_t batch_size,
                                            const cctz::time_zone* ctz, io::IOContext* io_ctx,
                                            RuntimeState* state, FileMetaCache* meta_cache)
-        : _table_reader(kv_cache, profile, params, range, batch_size, ctz, io_ctx, state,
-                        meta_cache) {}
+        : _table_reader(kv_cache),
+          _runtime_options(
+                  _build_runtime_options(profile, batch_size, ctz, io_ctx, state, meta_cache)),
+          _split(_extract_split(range)) {}
 
 Status IcebergReaderAdapter::_do_init_reader(ReaderInitContext* ctx) {
     TableReaderScanTask task;
     task.options.tuple_descriptor = ctx->tuple_descriptor;
     task.options.output_slots = ctx->tuple_descriptor->slots();
-    task.options.read_context.legacy_init_context = ctx;
-    task.options.read_context.state = ctx->state;
+    task.options.runtime_options = _runtime_options;
+    task.options.runtime_options.read_context.legacy_init_context = ctx;
+    task.options.runtime_options.read_context.state = ctx->state;
+    task.split = _split;
     return _table_reader.initialize_scan(task, &_scan_state);
 }
 
 Status IcebergReaderAdapter::_do_get_next_block(Block* block, size_t* read_rows, bool* eof) {
     return _table_reader.scan(&_scan_state, block, read_rows, eof);
+}
+
+ReaderRuntimeOptions IcebergReaderAdapter::_build_runtime_options(
+        RuntimeProfile* profile, size_t batch_size, const cctz::time_zone* ctz,
+        io::IOContext* io_ctx, RuntimeState* state, FileMetaCache* meta_cache) {
+    ReaderRuntimeOptions options;
+    options.read_context.state = state;
+    options.read_context.profile = profile;
+    options.batch_size = batch_size;
+    options.ctz = ctz;
+    options.io_ctx = io_ctx;
+    options.meta_cache = meta_cache;
+    return options;
+}
+
+TableReaderSplit IcebergReaderAdapter::_extract_split(const TFileRangeDesc& range) {
+    TableReaderSplit split;
+    split.data_file.path = range.path;
+    split.data_file.start_offset = range.start_offset;
+    split.data_file.size = range.size;
+    split.data_file.format = "parquet";
+    return split;
 }
 
 } // namespace doris

@@ -34,8 +34,6 @@ namespace doris {
 class FileMetaCache;
 class RuntimeProfile;
 class RuntimeState;
-class TFileRangeDesc;
-class TFileScanRangeParams;
 
 namespace cctz {
 class time_zone;
@@ -81,9 +79,7 @@ struct ParquetScanState final : public FormatReaderScanState {
 
 class ParquetReader final : public BaseFileFormatReader {
 public:
-    ParquetReader(RuntimeProfile* profile, const TFileScanRangeParams& params,
-                  const TFileRangeDesc& range, size_t batch_size, const cctz::time_zone* ctz,
-                  io::IOContext* io_ctx, RuntimeState* state, FileMetaCache* meta_cache);
+    ParquetReader(FileSplit split, ReaderRuntimeOptions runtime_options);
 
     Status open() override;
     const PhysicalFileSchema& physical_schema() const override { return _footer.schema; }
@@ -113,9 +109,6 @@ private:
                                  Block* block);
     Status _materialize_auxiliary_columns(const ParquetScanState& state, Block* block);
 
-    RuntimeProfile* _profile = nullptr;
-    const TFileScanRangeParams& _params;
-    const TFileRangeDesc& _range;
     size_t _batch_size = 0;
     const cctz::time_zone* _ctz = nullptr;
     io::IOContext* _io_ctx = nullptr;

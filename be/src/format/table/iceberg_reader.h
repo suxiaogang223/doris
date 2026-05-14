@@ -68,10 +68,7 @@ struct IcebergTableReaderScanState final : public TableReaderScanState {
 
 class IcebergTableReader final : public TableReader {
 public:
-    IcebergTableReader(ShardedKVCache* kv_cache, RuntimeProfile* profile,
-                       const TFileScanRangeParams& params, const TFileRangeDesc& range,
-                       size_t batch_size, const cctz::time_zone* ctz, io::IOContext* io_ctx,
-                       RuntimeState* state, FileMetaCache* meta_cache);
+    explicit IcebergTableReader(ShardedKVCache* kv_cache);
 
     Status initialize_scan(const TableReaderScanTask& task, TableReaderScanState* state) override;
     Status scan(TableReaderScanState* state, Block* block, size_t* read_rows, bool* eof) override;
@@ -97,14 +94,6 @@ private:
     Status _project_final_block(IcebergTableReaderScanState* state, Block* block);
 
     ShardedKVCache* _kv_cache = nullptr;
-    RuntimeProfile* _profile = nullptr;
-    const TFileScanRangeParams& _params;
-    const TFileRangeDesc& _range;
-    size_t _batch_size = 0;
-    const cctz::time_zone* _ctz = nullptr;
-    io::IOContext* _io_ctx = nullptr;
-    RuntimeState* _state = nullptr;
-    FileMetaCache* _meta_cache = nullptr;
 };
 
 class IcebergReaderAdapter final : public GenericReader {
@@ -121,7 +110,15 @@ protected:
     Status _do_get_next_block(Block* block, size_t* read_rows, bool* eof) override;
 
 private:
+    static ReaderRuntimeOptions _build_runtime_options(RuntimeProfile* profile, size_t batch_size,
+                                                       const cctz::time_zone* ctz,
+                                                       io::IOContext* io_ctx, RuntimeState* state,
+                                                       FileMetaCache* meta_cache);
+    static TableReaderSplit _extract_split(const TFileRangeDesc& range);
+
     IcebergTableReader _table_reader;
+    ReaderRuntimeOptions _runtime_options;
+    TableReaderSplit _split;
     IcebergTableReaderScanState _scan_state;
 };
 

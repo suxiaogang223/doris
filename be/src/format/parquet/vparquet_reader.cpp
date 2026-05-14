@@ -22,20 +22,13 @@
 
 namespace doris {
 
-ParquetReader::ParquetReader(RuntimeProfile* profile, const TFileScanRangeParams& params,
-                             const TFileRangeDesc& range, size_t batch_size,
-                             const cctz::time_zone* ctz, io::IOContext* io_ctx, RuntimeState* state,
-                             FileMetaCache* meta_cache)
-        : BaseFileFormatReader(range.path, range.start_offset, range.size,
-                               FileReadContext {nullptr, state, profile}),
-          _profile(profile),
-          _params(params),
-          _range(range),
-          _batch_size(std::max<size_t>(batch_size, 1)),
-          _ctz(ctz),
-          _io_ctx(io_ctx),
-          _state(state),
-          _meta_cache(meta_cache) {}
+ParquetReader::ParquetReader(FileSplit split, ReaderRuntimeOptions runtime_options)
+        : BaseFileFormatReader(std::move(split), runtime_options),
+          _batch_size(std::max<size_t>(runtime_options.batch_size, 1)),
+          _ctz(runtime_options.ctz),
+          _io_ctx(runtime_options.io_ctx),
+          _state(runtime_options.read_context.state),
+          _meta_cache(runtime_options.meta_cache) {}
 
 Status ParquetReader::open() {
     RETURN_IF_ERROR(_open_footer());

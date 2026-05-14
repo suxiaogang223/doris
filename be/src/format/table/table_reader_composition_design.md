@@ -4,9 +4,12 @@ This experiment intentionally removes the old `IcebergReaderMixin<ParquetReader>
 inheritance design from the Iceberg + Parquet path.
 
 Doris BE does not own Iceberg file enumeration. FE resolves the Iceberg snapshot,
-manifests and data files, then sends BE a sequence of `TFileRangeDesc` splits.
-Therefore the BE reader boundary is one split, but the API role still mirrors
-DuckDB:
+manifests and data files, then sends BE a sequence of thrift scan ranges.
+`FileScanner` still receives that thrift boundary, but `IcebergReaderAdapter`
+immediately extracts it into small reader-owned structs. `IcebergTableReader`
+and `ParquetReader` do not accept `TFileScanRangeParams` or `TFileRangeDesc`,
+which keeps the reader API small enough for unit tests to construct directly.
+The BE reader boundary is one split, but the API role still mirrors DuckDB:
 
 - DuckDB `MultiFileReader` -> Doris `TableReader`
 - DuckDB `BaseFileReader` -> Doris `BaseFileFormatReader`
@@ -68,8 +71,14 @@ tree plus definition/repetition level buffers. This follows DuckDB's
 not returned across the file/table boundary.
 
 `FileFormatReader` is a narrow interface. `BaseFileFormatReader` carries common
-fields shared by physical formats: file path, split range, read context and
+fields shared by physical formats: `FileSplit`, `ReaderRuntimeOptions` and
 `scan_properties`.
+
+`FileSplit` contains only physical split data such as path, offset, size and
+format. `ReaderRuntimeOptions` contains runtime-only dependencies such as batch
+size, timezone, IO context, file metadata cache and the legacy init context.
+This is the only API shape table/file readers need; thrift conversion belongs
+to the adapter layer.
 
 ## Lazy materialization contract
 

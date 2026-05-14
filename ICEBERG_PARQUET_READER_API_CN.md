@@ -18,7 +18,9 @@ MultiFileReader
 ```
 
 Doris 不直接照搬 `MultiFile` 命名，因为 BE 不负责 Iceberg 文件枚举。FE 已经完成
-snapshot、manifest、data file 和 split 切分，BE 只消费一个个 `TFileRangeDesc`。
+snapshot、manifest、data file 和 split 切分。`FileScanner` 仍然接收 thrift scan
+range，但 thrift 只停留在 `IcebergReaderAdapter` 边界；`IcebergTableReader` 和
+`ParquetReader` 只接收最小化的 reader options，便于单元测试直接构造。
 
 Doris 中对应关系是：
 
@@ -109,15 +111,35 @@ close()
 
 它承载所有文件格式 reader 都需要的公共字段：
 
-- `file_path`
-- `split_start`
-- `split_size`
-- `read_context`
+- `FileSplit`
+- `ReaderRuntimeOptions`
 - `scan_properties`
 
 和 DuckDB `BaseFileReader` 一样，文件层读计划不是额外 task 对象，而是 base reader
 上的成员配置。`scan_properties` 保存 schema mapping、required fields、row visibility、
 virtual columns 等由 `TableReader` 下发给文件层的计划。
+
+### `FileSplit` / `ReaderRuntimeOptions`
+
+`FileSplit` 是 reader 层看到的最小物理 split：
+
+- `path`
+- `start_offset`
+- `size`
+- `file_size`
+- `fs_name`
+- `format`
+
+`ReaderRuntimeOptions` 是 reader 层运行期依赖：
+
+- `FileReadContext`
+- `batch_size`
+- `ctz`
+- `io_ctx`
+- `meta_cache`
+
+`TFileScanRangeParams` 和 `TFileRangeDesc` 不进入 `TableReader` 或
+`FileFormatReader` 构造函数。旧 scanner 适配层负责把 thrift 拆成这些小结构。
 
 ### `ParquetReader`
 
@@ -208,7 +230,7 @@ Parquet 的具体文件层状态，对应 DuckDB `ParquetReaderScanState`。
 
 ### 4.1 `IcebergTableReader::initialize_scan`
 
-1. 从 `TFileRangeDesc` 提取当前 split 的 Iceberg 元信息
+1. 从 `TableReaderScanTask::split` 提取当前 split 的 Iceberg 元信息
 2. 根据文件格式创建 `FileFormatReader`，当前实验只创建 `ParquetReader`
 3. `ParquetReader::open()` 读取 footer 和 physical schema
 4. `IcebergTableReader` 基于 physical schema 构造 `FieldMappingNode`

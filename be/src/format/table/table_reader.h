@@ -35,10 +35,19 @@
 
 namespace doris {
 
+class FileMetaCache;
 class RuntimeProfile;
 class RuntimeState;
 class SlotDescriptor;
 class TupleDescriptor;
+
+namespace cctz {
+class time_zone;
+} // namespace cctz
+
+namespace io {
+struct IOContext;
+} // namespace io
 
 // This file intentionally mirrors DuckDB's reader split while using Doris names:
 //
@@ -165,6 +174,28 @@ struct FileReadContext {
     RuntimeProfile* profile = nullptr;
 };
 
+struct ReaderRuntimeOptions {
+    FileReadContext read_context;
+    size_t batch_size = 0;
+    const cctz::time_zone* ctz = nullptr;
+    io::IOContext* io_ctx = nullptr;
+    FileMetaCache* meta_cache = nullptr;
+};
+
+struct FileSplit {
+    std::string path;
+    int64_t start_offset = 0;
+    int64_t size = -1;
+    int64_t file_size = -1;
+    std::string fs_name;
+    std::string format = "parquet";
+};
+
+struct TableReaderSplit {
+    FileSplit data_file;
+    std::unordered_map<std::string, std::string> table_properties;
+};
+
 struct PhysicalFileSchema {
     FieldMappingNode root;
     bool has_field_ids = false;
@@ -222,29 +253,24 @@ public:
 
 class BaseFileFormatReader : public FileFormatReader {
 public:
-    BaseFileFormatReader(std::string path, int64_t split_start, int64_t split_size,
-                         FileReadContext read_context)
-            : file_path(std::move(path)),
-              split_start(split_start),
-              split_size(split_size),
-              read_context(read_context) {}
+    explicit BaseFileFormatReader(FileSplit split, ReaderRuntimeOptions runtime_options)
+            : split(std::move(split)), runtime_options(runtime_options) {}
     ~BaseFileFormatReader() override = default;
 
-    const std::string file_path;
-    const int64_t split_start = 0;
-    const int64_t split_size = -1;
-    FileReadContext read_context;
+    FileSplit split;
+    ReaderRuntimeOptions runtime_options;
     FileFormatScanProperties scan_properties;
 };
 
 struct TableReaderOptions {
     const TupleDescriptor* tuple_descriptor = nullptr;
     std::vector<SlotDescriptor*> output_slots;
-    FileReadContext read_context;
+    ReaderRuntimeOptions runtime_options;
 };
 
 struct TableReaderScanTask {
     TableReaderOptions options;
+    TableReaderSplit split;
 };
 
 struct TableReaderScanState {
