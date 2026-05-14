@@ -170,7 +170,7 @@ struct PhysicalFileSchema {
     bool has_field_ids = false;
 };
 
-struct FormatScanTask {
+struct FileFormatScanProperties {
     std::string path;
     int64_t split_start = 0;
     int64_t split_size = -1;
@@ -216,7 +216,6 @@ public:
 struct FormatReaderScanState {
     virtual ~FormatReaderScanState() = default;
 
-    FormatScanTask task;
     SelectionVector selection;
     bool finished = false;
 };
@@ -225,9 +224,11 @@ class FileFormatReader {
 public:
     virtual ~FileFormatReader() = default;
 
+    FileFormatScanProperties scan_properties;
+
     virtual Status open() = 0;
     virtual const PhysicalFileSchema& physical_schema() const = 0;
-    virtual Status initialize_scan(const FormatScanTask& task, FormatReaderScanState* state) = 0;
+    virtual Status initialize_scan(FormatReaderScanState* state) = 0;
     virtual Status scan(FormatReaderScanState* state, PhysicalReadBatch* batch, bool* eof) = 0;
     virtual Status close() = 0;
 };

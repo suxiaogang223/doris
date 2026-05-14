@@ -99,8 +99,8 @@ Status read_iceberg_position_delete_file(const TIcebergDeleteFileDesc& delete_fi
     //
     // IcebergTableReader::_build_delete_plan owns position delete planning. It
     // should instantiate a FileFormatReader for the delete file format
-    // (ParquetReader today, OrcReader-as-FileFormatReader later), build a
-    // FormatScanTask with required fields:
+    // (ParquetReader today, OrcReader-as-FileFormatReader later), configure
+    // FileFormatReader::scan_properties with required fields:
     //   - file_path as hidden delete metadata
     //   - pos as hidden delete metadata
     // and stream those rows into RowVisibility::deleted_rows for the current

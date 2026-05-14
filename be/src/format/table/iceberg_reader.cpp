@@ -56,11 +56,10 @@ Status IcebergTableReader::initialize_scan(const TableReaderScanTask& task,
     RETURN_IF_ERROR(_build_delete_plan(iceberg_state));
     RETURN_IF_ERROR(_build_required_fields(iceberg_state));
     RETURN_IF_ERROR(_build_virtual_column_plan(iceberg_state));
-    RETURN_IF_ERROR(_build_format_scan_task(task, iceberg_state));
+    RETURN_IF_ERROR(_configure_file_reader(task, iceberg_state));
 
     iceberg_state->format_state = std::make_unique<ParquetScanState>();
-    return iceberg_state->file_reader->initialize_scan(iceberg_state->format_task,
-                                                       iceberg_state->format_state.get());
+    return iceberg_state->file_reader->initialize_scan(iceberg_state->format_state.get());
 }
 
 Status IcebergTableReader::scan(TableReaderScanState* state, Block* block, size_t* read_rows,
@@ -220,22 +219,23 @@ Status IcebergTableReader::_build_virtual_column_plan(IcebergTableReaderScanStat
     return Status::OK();
 }
 
-Status IcebergTableReader::_build_format_scan_task(const TableReaderScanTask& task,
-                                                   IcebergTableReaderScanState* state) {
-    state->format_task.path = _range.path;
-    state->format_task.split_start = _range.start_offset;
-    state->format_task.split_size = _range.size;
-    state->format_task.schema_mapping_root = state->mapping;
-    state->format_task.required_fields = state->required_fields;
-    state->format_task.row_visibility = state->delete_plan.row_visibility;
-    state->format_task.virtual_columns = state->virtual_columns;
-    state->format_task.read_context = task.options.read_context;
-    state->format_task.physical_read_template = Block(task.options.tuple_descriptor->slots(), 0);
+Status IcebergTableReader::_configure_file_reader(const TableReaderScanTask& task,
+                                                  IcebergTableReaderScanState* state) {
+    auto& properties = state->file_reader->scan_properties;
+    properties.path = _range.path;
+    properties.split_start = _range.start_offset;
+    properties.split_size = _range.size;
+    properties.schema_mapping_root = state->mapping;
+    properties.required_fields = state->required_fields;
+    properties.row_visibility = state->delete_plan.row_visibility;
+    properties.virtual_columns = state->virtual_columns;
+    properties.read_context = task.options.read_context;
+    properties.physical_read_template = Block(task.options.tuple_descriptor->slots(), 0);
 
-    state->format_task.need_row_positions = state->format_task.row_visibility.needs_row_positions();
-    for (const auto& field : state->format_task.required_fields) {
-        state->format_task.need_row_positions |= field.purpose == RequiredFieldPurpose::ROW_ID ||
-                                                 field.purpose == RequiredFieldPurpose::ROW_LINEAGE;
+    properties.need_row_positions = properties.row_visibility.needs_row_positions();
+    for (const auto& field : properties.required_fields) {
+        properties.need_row_positions |= field.purpose == RequiredFieldPurpose::ROW_ID ||
+                                         field.purpose == RequiredFieldPurpose::ROW_LINEAGE;
     }
     return Status::OK();
 }

@@ -40,18 +40,17 @@ Status ParquetReader::open() {
     return Status::OK();
 }
 
-Status ParquetReader::initialize_scan(const FormatScanTask& task, FormatReaderScanState* state) {
+Status ParquetReader::initialize_scan(FormatReaderScanState* state) {
     auto* parquet_state = static_cast<ParquetScanState*>(state);
-    parquet_state->task = task;
     parquet_state->finished = false;
     parquet_state->current_row_group = -1;
     parquet_state->offset_in_row_group = 0;
     parquet_state->row_group_first_row = 0;
     parquet_state->current_row_group_prefetched = false;
-    parquet_state->output_template = task.physical_read_template;
+    parquet_state->output_template = scan_properties.physical_read_template;
 
-    RETURN_IF_ERROR(_build_lazy_read_plan(task, &parquet_state->lazy_plan));
-    RETURN_IF_ERROR(_create_column_reader_tree(task, parquet_state));
+    RETURN_IF_ERROR(_build_lazy_read_plan(&parquet_state->lazy_plan));
+    RETURN_IF_ERROR(_create_column_reader_tree(parquet_state));
     return Status::OK();
 }
 
@@ -93,9 +92,9 @@ Status ParquetReader::_open_footer() {
     return Status::OK();
 }
 
-Status ParquetReader::_build_lazy_read_plan(const FormatScanTask& task, ParquetLazyReadPlan* plan) {
+Status ParquetReader::_build_lazy_read_plan(ParquetLazyReadPlan* plan) {
     *plan = ParquetLazyReadPlan {};
-    for (const auto& field : task.required_fields) {
+    for (const auto& field : scan_properties.required_fields) {
         if (field.purpose == RequiredFieldPurpose::PREDICATE) {
             plan->predicate_fields.push_back(field);
         } else if (field.purpose == RequiredFieldPurpose::LEVELS_ONLY ||
@@ -110,12 +109,11 @@ Status ParquetReader::_build_lazy_read_plan(const FormatScanTask& task, ParquetL
     return Status::OK();
 }
 
-Status ParquetReader::_create_column_reader_tree(const FormatScanTask& task,
-                                                 ParquetScanState* state) {
+Status ParquetReader::_create_column_reader_tree(ParquetScanState* state) {
     // Pseudocode, directly aligned with DuckDB CreateReaderRecursive:
     //
-    // Build a recursive ColumnReader tree from task.schema_mapping_root and the
-    // physical Parquet schema. Leaf readers decode pages. Struct/list/map
+    // Build a recursive ColumnReader tree from scan_properties.schema_mapping_root
+    // and the physical Parquet schema. Leaf readers decode pages. Struct/list/map
     // readers own children and preserve definition/repetition level semantics.
     // Expression/virtual readers are wrappers only when the physical layer can
     // safely evaluate them before lazy payload reads.
@@ -211,12 +209,12 @@ Status ParquetReader::_apply_row_group_pruning(ParquetScanState* state) {
 
 Status ParquetReader::_apply_row_visibility(ParquetScanState* state,
                                             ParquetRowGroupTask* row_group) {
-    if (!state->task.row_visibility.needs_row_positions()) {
+    if (!scan_properties.row_visibility.needs_row_positions()) {
         return Status::OK();
     }
     for (size_t i = 0; i < row_group->candidate_rows.selected.size(); ++i) {
         const int64_t file_row = row_group->first_row + static_cast<int64_t>(i);
-        if (!state->task.row_visibility.is_visible(file_row)) {
+        if (!scan_properties.row_visibility.is_visible(file_row)) {
             row_group->candidate_rows.selected[i] = 0;
         }
     }
@@ -237,7 +235,7 @@ Status ParquetReader::_read_predicate_columns(ParquetScanState* state,
 
 Status ParquetReader::_materialize_predicate_virtual_columns(ParquetScanState* state,
                                                              PhysicalReadBatch* batch) {
-    for (const auto& [_, handler] : state->task.virtual_columns.predicate_virtual_columns) {
+    for (const auto& [_, handler] : scan_properties.virtual_columns.predicate_virtual_columns) {
         RETURN_IF_ERROR(handler(&batch->physical_block, batch->physical_rows, &batch->selection));
     }
     return Status::OK();
@@ -261,7 +259,7 @@ Status ParquetReader::_read_payload_columns(ParquetScanState* state,
     //
     // This mirrors DuckDB's Filter/Select/Skip boundary and keeps table-format
     // semantics outside the Parquet reader.
-    for (const auto& [_, handler] : state->task.virtual_columns.payload_virtual_columns) {
+    for (const auto& [_, handler] : scan_properties.virtual_columns.payload_virtual_columns) {
         RETURN_IF_ERROR(handler(&batch->physical_block, batch->selection.selected_rows(),
                                 &batch->selection));
     }
@@ -281,7 +279,7 @@ Status ParquetReader::_read_levels_only_columns(ParquetScanState* state,
 Status ParquetReader::_attach_row_positions(ParquetScanState* state,
                                             const ParquetRowGroupTask& row_group,
                                             PhysicalReadBatch* batch) {
-    if (!state->task.need_row_positions) {
+    if (!scan_properties.need_row_positions) {
         return Status::OK();
     }
     batch->row_positions.clear();

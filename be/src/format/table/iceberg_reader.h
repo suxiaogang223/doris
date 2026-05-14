@@ -63,7 +63,6 @@ struct IcebergTableReaderScanState final : public TableReaderScanState {
     FieldMappingNode mapping;
     std::vector<RequiredField> required_fields;
     VirtualColumnPlan virtual_columns;
-    FormatScanTask format_task;
     std::unique_ptr<FileFormatReader> file_reader;
 };
 
@@ -87,8 +86,8 @@ private:
     Status _build_delete_plan(IcebergTableReaderScanState* state);
     Status _build_required_fields(IcebergTableReaderScanState* state);
     Status _build_virtual_column_plan(IcebergTableReaderScanState* state);
-    Status _build_format_scan_task(const TableReaderScanTask& task,
-                                   IcebergTableReaderScanState* state);
+    Status _configure_file_reader(const TableReaderScanTask& task,
+                                  IcebergTableReaderScanState* state);
     Status _finalize_block(IcebergTableReaderScanState* state, PhysicalReadBatch* batch,
                            Block* block, size_t* read_rows);
     Status _apply_equality_delete(IcebergTableReaderScanState* state, PhysicalReadBatch* batch);

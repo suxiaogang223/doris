@@ -56,7 +56,9 @@ cursors.
 
 `IcebergTableReaderScanState` owns the split context, schema mapping, delete
 plan, required fields, virtual column plan, the selected `FileFormatReader` and
-its `FormatReaderScanState`.
+its `FormatReaderScanState`. The file read plan is configured on
+`FileFormatReader::scan_properties`, mirroring DuckDB's `BaseFileReader`
+members instead of using a separate task object.
 
 `ParquetScanState` owns row-group cursor state, selection, lazy read plan,
 output template, and pseudocode placeholders for the recursive `ColumnReader`
@@ -65,7 +67,7 @@ tree plus definition/repetition level buffers. This follows DuckDB's
 
 ## Lazy materialization contract
 
-`FormatScanTask::required_fields` classifies fields by purpose:
+`FileFormatReader::scan_properties.required_fields` classifies fields by purpose:
 
 - `PREDICATE`
 - `OUTPUT`

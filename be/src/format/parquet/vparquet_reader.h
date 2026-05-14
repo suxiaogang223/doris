@@ -87,14 +87,14 @@ public:
 
     Status open() override;
     const PhysicalFileSchema& physical_schema() const override { return _footer.schema; }
-    Status initialize_scan(const FormatScanTask& task, FormatReaderScanState* state) override;
+    Status initialize_scan(FormatReaderScanState* state) override;
     Status scan(FormatReaderScanState* state, PhysicalReadBatch* batch, bool* eof) override;
     Status close() override;
 
 private:
     Status _open_footer();
-    Status _build_lazy_read_plan(const FormatScanTask& task, ParquetLazyReadPlan* plan);
-    Status _create_column_reader_tree(const FormatScanTask& task, ParquetScanState* state);
+    Status _build_lazy_read_plan(ParquetLazyReadPlan* plan);
+    Status _create_column_reader_tree(ParquetScanState* state);
     Status _scan_internal(ParquetScanState* state, PhysicalReadBatch* batch, bool* produced,
                           bool* eof);
     Status _switch_row_group(ParquetScanState* state, bool* eof);

@@ -97,10 +97,14 @@ close()
 ```cpp
 open()
 physical_schema()
-initialize_scan(FormatScanTask, FormatReaderScanState*)
+initialize_scan(FormatReaderScanState*)
 scan(FormatReaderScanState*, PhysicalReadBatch*, bool*)
 close()
 ```
+
+和 DuckDB `BaseFileReader` 一样，文件层读计划不是额外 task 对象，而是
+`FileFormatReader::scan_properties` 上的成员配置，例如 schema mapping、
+required fields、row visibility、virtual columns、split range。
 
 ### `ParquetReader`
 
@@ -164,7 +168,7 @@ Iceberg 的具体表层状态。
 - delete plan
 - required fields
 - virtual column plan
-- format scan task
+- file reader scan properties
 - file format reader
 
 ### `FormatReaderScanState`
@@ -198,7 +202,7 @@ Parquet 的具体文件层状态，对应 DuckDB `ParquetReaderScanState`。
 5. 构造 `IcebergDeletePlan`
 6. 构造 `RequiredField`
 7. 构造 `VirtualColumnPlan`
-8. 构造 `FormatScanTask`
+8. 配置 `FileFormatReader::scan_properties`
 9. 创建 `ParquetScanState`
 10. 调用 `ParquetReader::initialize_scan`
 
@@ -267,7 +271,7 @@ equality delete key 被加入 hidden `RequiredField`。`ParquetReader` 像读普
 
 ### row id / lineage
 
-`FormatScanTask::need_row_positions` 要求文件层返回 `row_positions`。`IcebergTableReader`
+`FileFormatReader::scan_properties.need_row_positions` 要求文件层返回 `row_positions`。`IcebergTableReader`
 结合 split metadata 生成 `$row_id`、`_row_id`、
 `_last_updated_sequence_number`。
 
