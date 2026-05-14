@@ -68,14 +68,13 @@ Status IcebergTableReader::scan(TableReaderScanState* state, Block* block, size_
     DORIS_CHECK(iceberg_state->file_reader != nullptr);
     DORIS_CHECK(iceberg_state->format_state != nullptr);
 
-    PhysicalReadBatch batch;
     RETURN_IF_ERROR(
-            iceberg_state->file_reader->scan(iceberg_state->format_state.get(), &batch, eof));
-    if (*eof || batch.physical_rows == 0) {
+            iceberg_state->file_reader->scan(iceberg_state->format_state.get(), block, eof));
+    if (*eof || block->rows() == 0) {
         *read_rows = 0;
         return Status::OK();
     }
-    return _finalize_block(iceberg_state, &batch, block, read_rows);
+    return _finalize_block(iceberg_state, block, read_rows);
 }
 
 Status IcebergTableReader::finish_scan(TableReaderScanState* state) {
@@ -236,36 +235,35 @@ Status IcebergTableReader::_configure_file_reader(const TableReaderScanTask& tas
     return Status::OK();
 }
 
-Status IcebergTableReader::_finalize_block(IcebergTableReaderScanState* state,
-                                           PhysicalReadBatch* batch, Block* block,
+Status IcebergTableReader::_finalize_block(IcebergTableReaderScanState* state, Block* block,
                                            size_t* read_rows) {
-    RETURN_IF_ERROR(_apply_equality_delete(state, batch));
-    RETURN_IF_ERROR(_apply_residual_predicates(state, batch));
-    RETURN_IF_ERROR(_fill_missing_and_partition_columns(state, batch));
-    RETURN_IF_ERROR(_fill_generated_columns(state, batch));
-    RETURN_IF_ERROR(_fill_row_id_columns(state, batch));
-    RETURN_IF_ERROR(_project_final_block(state, batch, block));
+    RETURN_IF_ERROR(_apply_equality_delete(state, block));
+    RETURN_IF_ERROR(_apply_residual_predicates(state, block));
+    RETURN_IF_ERROR(_fill_missing_and_partition_columns(state, block));
+    RETURN_IF_ERROR(_fill_generated_columns(state, block));
+    RETURN_IF_ERROR(_fill_row_id_columns(state, block));
+    RETURN_IF_ERROR(_project_final_block(state, block));
     *read_rows = block->rows();
     return Status::OK();
 }
 
 Status IcebergTableReader::_apply_equality_delete(IcebergTableReaderScanState* state,
-                                                  PhysicalReadBatch* batch) {
+                                                  Block* block) {
     // Pseudocode:
-    // Use hidden equality delete key columns in batch->physical_block to filter
-    // rows. Hidden columns are removed in _project_final_block.
+    // Use hidden equality delete key columns in block to filter rows. Hidden
+    // columns are removed in _project_final_block.
     return Status::OK();
 }
 
 Status IcebergTableReader::_apply_residual_predicates(IcebergTableReaderScanState* state,
-                                                      PhysicalReadBatch* batch) {
+                                                      Block* block) {
     // Pseudocode:
     // Casts or predicates not safe for Parquet pushdown are evaluated here.
     return Status::OK();
 }
 
 Status IcebergTableReader::_fill_missing_and_partition_columns(IcebergTableReaderScanState* state,
-                                                               PhysicalReadBatch* batch) {
+                                                               Block* block) {
     // Pseudocode:
     // Fill top-level missing columns by row count. Fill nested missing columns
     // using REFERENCE_LEVELS fields so array<struct<missing>> follows element
@@ -274,29 +272,25 @@ Status IcebergTableReader::_fill_missing_and_partition_columns(IcebergTableReade
 }
 
 Status IcebergTableReader::_fill_generated_columns(IcebergTableReaderScanState* state,
-                                                   PhysicalReadBatch* batch) {
+                                                   Block* block) {
     // Pseudocode:
     // Compute generated columns after dependencies are available.
     return Status::OK();
 }
 
-Status IcebergTableReader::_fill_row_id_columns(IcebergTableReaderScanState* state,
-                                                PhysicalReadBatch* batch) {
+Status IcebergTableReader::_fill_row_id_columns(IcebergTableReaderScanState* state, Block* block) {
     // Pseudocode:
-    // Use batch->row_positions plus state->split metadata to fill:
+    // Use the hidden row-position column plus state->split metadata to fill:
     //   - $row_id
     //   - _row_id = first_row_id + row_position
     //   - _last_updated_sequence_number
     return Status::OK();
 }
 
-Status IcebergTableReader::_project_final_block(IcebergTableReaderScanState* state,
-                                                PhysicalReadBatch* batch, Block* block) {
+Status IcebergTableReader::_project_final_block(IcebergTableReaderScanState* state, Block* block) {
     // Pseudocode:
-    // 1. Drop hidden equality delete and levels-only columns.
+    // 1. Drop hidden equality delete, row-position and levels-only columns.
     // 2. Reorder columns to match tuple descriptor.
-    // 3. Move the result into block.
-    *block = std::move(batch->physical_block);
     return Status::OK();
 }
 

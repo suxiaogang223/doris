@@ -180,14 +180,6 @@ struct FileFormatScanProperties {
     Block physical_read_template;
 };
 
-struct PhysicalReadBatch {
-    Block physical_block;
-    SelectionVector selection;
-    std::vector<segment_v2::rowid_t> row_positions;
-    std::vector<std::string> hidden_columns;
-    size_t physical_rows = 0;
-};
-
 struct ColumnReadContext {
     RequiredField field;
     FieldMappingNode mapping;
@@ -213,6 +205,7 @@ struct FormatReaderScanState {
     virtual ~FormatReaderScanState() = default;
 
     SelectionVector selection;
+    size_t selected_rows = 0;
     bool finished = false;
 };
 
@@ -223,7 +216,7 @@ public:
     virtual Status open() = 0;
     virtual const PhysicalFileSchema& physical_schema() const = 0;
     virtual Status initialize_scan(FormatReaderScanState* state) = 0;
-    virtual Status scan(FormatReaderScanState* state, PhysicalReadBatch* batch, bool* eof) = 0;
+    virtual Status scan(FormatReaderScanState* state, Block* block, bool* eof) = 0;
     virtual Status close() = 0;
 };
 

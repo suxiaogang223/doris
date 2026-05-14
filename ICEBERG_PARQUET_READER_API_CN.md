@@ -61,7 +61,7 @@ Iceberg 或 Parquet 语义。
 - 规划 required fields、predicate fields、hidden fields
 - 规划 position delete / deletion vector / equality delete
 - 协调虚拟列、missing/default/generated/synthesized 列
-- 接收 `PhysicalReadBatch` 并输出最终 Doris `Block`
+- 接收文件层直接填好的 `Block` 并输出最终 Doris `Block`
 
 接口：
 
@@ -99,7 +99,7 @@ close()
 open()
 physical_schema()
 initialize_scan(FormatReaderScanState*)
-scan(FormatReaderScanState*, PhysicalReadBatch*, bool*)
+scan(FormatReaderScanState*, Block*, bool*)
 close()
 ```
 
@@ -131,8 +131,8 @@ virtual columns 等由 `TableReader` 下发给文件层的计划。
 - predicate fields 优先读取
 - lazy payload read
 - levels-only / reference-levels read
-- row positions 输出
-- hidden physical columns 输出
+- row position hidden column 输出
+- hidden physical columns 输出到同一个 `Block`
 - prefetch 策略
 
 它不负责：
@@ -197,7 +197,7 @@ Parquet 的具体文件层状态，对应 DuckDB `ParquetReaderScanState`。
 - 当前 row group
 - row group 内 offset
 - row group first row
-- selection
+- selection（文件层内部状态，不跨层返回）
 - lazy read plan
 - output template
 - root `ColumnReader` tree（伪代码）
@@ -231,11 +231,11 @@ Parquet 的具体文件层状态，对应 DuckDB `ParquetReaderScanState`。
 8. 对 payload fields 调用 `ColumnReader::select`
 9. 对全过滤 payload 调用 `ColumnReader::skip`
 10. 读取 levels-only/reference-level fields
-11. 输出 row positions 和 hidden columns
+11. 将 row positions、equality delete key、levels-only 数据作为 hidden columns 放入同一个 `Block`
 
 ### 4.3 `IcebergTableReader::scan`
 
-1. 调用 `FileFormatReader::scan` 得到 `PhysicalReadBatch`
+1. 调用 `FileFormatReader::scan` 得到文件层填好的 `Block`
 2. 应用 equality delete
 3. 应用 residual predicate
 4. 填充 missing / partition columns
@@ -284,8 +284,8 @@ equality delete key 被加入 hidden `RequiredField`。`ParquetReader` 像读普
 
 ### row id / lineage
 
-`BaseFileFormatReader::scan_properties.need_row_positions` 要求文件层返回 `row_positions`。`IcebergTableReader`
-结合 split metadata 生成 `$row_id`、`_row_id`、
+`BaseFileFormatReader::scan_properties.need_row_positions` 要求文件层生成 hidden row-position
+column。`IcebergTableReader` 结合 split metadata 生成 `$row_id`、`_row_id`、
 `_last_updated_sequence_number`。
 
 ## 6. 当前实验状态

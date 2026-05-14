@@ -64,7 +64,8 @@ members instead of using a separate task object.
 `ParquetScanState` owns row-group cursor state, selection, lazy read plan,
 output template, and pseudocode placeholders for the recursive `ColumnReader`
 tree plus definition/repetition level buffers. This follows DuckDB's
-`ParquetReaderScanState` shape.
+`ParquetReaderScanState` shape. Selection is internal to this scan state and is
+not returned across the file/table boundary.
 
 `FileFormatReader` is a narrow interface. `BaseFileFormatReader` carries common
 fields shared by physical formats: file path, split range, read context and
@@ -87,7 +88,9 @@ materialize predicate virtual columns, evaluate selection, and then call
 `ColumnReader::select` for payload fields only for selected rows. If no rows
 survive, payload readers use `ColumnReader::skip`. Position deletes and
 deletion vectors are represented as `RowVisibility` and are applied before
-payload lazy reads.
+payload lazy reads. The file reader returns a `Block` directly; row positions,
+equality-delete keys and levels-only data are hidden columns inside that block,
+not side-channel batch fields.
 
 ## Schema change contract
 

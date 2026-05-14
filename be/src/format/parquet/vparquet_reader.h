@@ -88,32 +88,30 @@ public:
     Status open() override;
     const PhysicalFileSchema& physical_schema() const override { return _footer.schema; }
     Status initialize_scan(FormatReaderScanState* state) override;
-    Status scan(FormatReaderScanState* state, PhysicalReadBatch* batch, bool* eof) override;
+    Status scan(FormatReaderScanState* state, Block* block, bool* eof) override;
     Status close() override;
 
 private:
     Status _open_footer();
     Status _build_lazy_read_plan(ParquetLazyReadPlan* plan);
     Status _create_column_reader_tree(ParquetScanState* state);
-    Status _scan_internal(ParquetScanState* state, PhysicalReadBatch* batch, bool* produced,
-                          bool* eof);
+    Status _scan_internal(ParquetScanState* state, Block* block, bool* produced, bool* eof);
     Status _switch_row_group(ParquetScanState* state, bool* eof);
     Status _prepare_row_group(ParquetScanState* state);
     Status _register_prefetch(ParquetScanState* state);
     Status _apply_row_group_pruning(ParquetScanState* state);
     Status _apply_row_visibility(ParquetScanState* state, ParquetRowGroupTask* row_group);
     Status _read_predicate_columns(ParquetScanState* state, const ParquetRowGroupTask& row_group,
-                                   PhysicalReadBatch* batch);
-    Status _materialize_predicate_virtual_columns(ParquetScanState* state,
-                                                  PhysicalReadBatch* batch);
-    Status _evaluate_predicates(ParquetScanState* state, PhysicalReadBatch* batch);
+                                   Block* block);
+    Status _materialize_predicate_virtual_columns(ParquetScanState* state, Block* block);
+    Status _evaluate_predicates(ParquetScanState* state, Block* block);
     Status _read_payload_columns(ParquetScanState* state, const ParquetRowGroupTask& row_group,
-                                 PhysicalReadBatch* batch);
+                                 Block* block);
     Status _read_levels_only_columns(ParquetScanState* state, const ParquetRowGroupTask& row_group,
-                                     PhysicalReadBatch* batch);
+                                     Block* block);
     Status _attach_row_positions(ParquetScanState* state, const ParquetRowGroupTask& row_group,
-                                 PhysicalReadBatch* batch);
-    Status _attach_hidden_columns(const ParquetScanState& state, PhysicalReadBatch* batch);
+                                 Block* block);
+    Status _materialize_auxiliary_columns(const ParquetScanState& state, Block* block);
 
     RuntimeProfile* _profile = nullptr;
     const TFileScanRangeParams& _params;

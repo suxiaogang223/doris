@@ -56,15 +56,15 @@ Status ParquetReader::initialize_scan(FormatReaderScanState* state) {
     return Status::OK();
 }
 
-Status ParquetReader::scan(FormatReaderScanState* state, PhysicalReadBatch* batch, bool* eof) {
+Status ParquetReader::scan(FormatReaderScanState* state, Block* block, bool* eof) {
     auto* parquet_state = static_cast<ParquetScanState*>(state);
     while (true) {
         bool produced = false;
-        RETURN_IF_ERROR(_scan_internal(parquet_state, batch, &produced, eof));
+        RETURN_IF_ERROR(_scan_internal(parquet_state, block, &produced, eof));
         if (*eof || produced) {
             return Status::OK();
         }
-        batch->physical_block.clear();
+        block->clear();
     }
 }
 
@@ -122,8 +122,8 @@ Status ParquetReader::_create_column_reader_tree(ParquetScanState* state) {
     return Status::OK();
 }
 
-Status ParquetReader::_scan_internal(ParquetScanState* state, PhysicalReadBatch* batch,
-                                     bool* produced, bool* eof) {
+Status ParquetReader::_scan_internal(ParquetScanState* state, Block* block, bool* produced,
+                                     bool* eof) {
     *produced = false;
     *eof = false;
     if (state->finished) {
@@ -139,10 +139,9 @@ Status ParquetReader::_scan_internal(ParquetScanState* state, PhysicalReadBatch*
         return Status::OK();
     }
 
-    batch->physical_block = state->output_template;
-    batch->hidden_columns.clear();
-    batch->row_positions.clear();
-    batch->physical_rows = 0;
+    *block = state->output_template;
+    state->selection.reset(0);
+    state->selected_rows = 0;
 
     ParquetRowGroupTask row_group;
     row_group.row_group_id = state->current_row_group;
@@ -151,16 +150,16 @@ Status ParquetReader::_scan_internal(ParquetScanState* state, PhysicalReadBatch*
     row_group.candidate_rows.reset(row_group.row_count, true);
 
     RETURN_IF_ERROR(_apply_row_visibility(state, &row_group));
-    RETURN_IF_ERROR(_read_predicate_columns(state, row_group, batch));
-    RETURN_IF_ERROR(_materialize_predicate_virtual_columns(state, batch));
-    RETURN_IF_ERROR(_evaluate_predicates(state, batch));
-    RETURN_IF_ERROR(_read_payload_columns(state, row_group, batch));
-    RETURN_IF_ERROR(_read_levels_only_columns(state, row_group, batch));
-    RETURN_IF_ERROR(_attach_row_positions(state, row_group, batch));
-    RETURN_IF_ERROR(_attach_hidden_columns(*state, batch));
+    RETURN_IF_ERROR(_read_predicate_columns(state, row_group, block));
+    RETURN_IF_ERROR(_materialize_predicate_virtual_columns(state, block));
+    RETURN_IF_ERROR(_evaluate_predicates(state, block));
+    RETURN_IF_ERROR(_read_payload_columns(state, row_group, block));
+    RETURN_IF_ERROR(_read_levels_only_columns(state, row_group, block));
+    RETURN_IF_ERROR(_attach_row_positions(state, row_group, block));
+    RETURN_IF_ERROR(_materialize_auxiliary_columns(*state, block));
 
     state->offset_in_row_group += row_group.row_count;
-    *produced = batch->physical_rows > 0;
+    *produced = block->rows() > 0 || state->selected_rows > 0;
     return Status::OK();
 }
 
@@ -224,35 +223,33 @@ Status ParquetReader::_apply_row_visibility(ParquetScanState* state,
 }
 
 Status ParquetReader::_read_predicate_columns(ParquetScanState* state,
-                                              const ParquetRowGroupTask& row_group,
-                                              PhysicalReadBatch* batch) {
+                                              const ParquetRowGroupTask& row_group, Block* block) {
     // Pseudocode:
     // for field in state->lazy_plan.predicate_fields:
     //   child_reader.Filter(row_group.row_count, levels, vector, predicate,
     //                       filter_state, selection, selected_rows)
-    batch->physical_rows = row_group.candidate_rows.selected_rows();
-    batch->selection = row_group.candidate_rows;
+    state->selected_rows = row_group.candidate_rows.selected_rows();
+    state->selection = row_group.candidate_rows;
     return Status::OK();
 }
 
 Status ParquetReader::_materialize_predicate_virtual_columns(ParquetScanState* state,
-                                                             PhysicalReadBatch* batch) {
+                                                             Block* block) {
     for (const auto& [_, handler] : scan_properties.virtual_columns.predicate_virtual_columns) {
-        RETURN_IF_ERROR(handler(&batch->physical_block, batch->physical_rows, &batch->selection));
+        RETURN_IF_ERROR(handler(block, state->selected_rows, &state->selection));
     }
     return Status::OK();
 }
 
-Status ParquetReader::_evaluate_predicates(ParquetScanState* state, PhysicalReadBatch* batch) {
+Status ParquetReader::_evaluate_predicates(ParquetScanState* state, Block* block) {
     // Pseudocode:
-    // Intersect vectorized predicate results into batch->selection. Adaptive
+    // Intersect vectorized predicate results into state->selection. Adaptive
     // predicate ordering belongs to scan state, as in DuckDB's AdaptiveFilter.
     return Status::OK();
 }
 
 Status ParquetReader::_read_payload_columns(ParquetScanState* state,
-                                            const ParquetRowGroupTask& row_group,
-                                            PhysicalReadBatch* batch) {
+                                            const ParquetRowGroupTask& row_group, Block* block) {
     // Pseudocode:
     // if selected_rows == 0:
     //   payload_reader.Skip(row_group.row_count)
@@ -262,15 +259,14 @@ Status ParquetReader::_read_payload_columns(ParquetScanState* state,
     // This mirrors DuckDB's Filter/Select/Skip boundary and keeps table-format
     // semantics outside the Parquet reader.
     for (const auto& [_, handler] : scan_properties.virtual_columns.payload_virtual_columns) {
-        RETURN_IF_ERROR(handler(&batch->physical_block, batch->selection.selected_rows(),
-                                &batch->selection));
+        RETURN_IF_ERROR(handler(block, state->selection.selected_rows(), &state->selection));
     }
     return Status::OK();
 }
 
 Status ParquetReader::_read_levels_only_columns(ParquetScanState* state,
                                                 const ParquetRowGroupTask& row_group,
-                                                PhysicalReadBatch* batch) {
+                                                Block* block) {
     // Pseudocode:
     // For nested missing fields, call ColumnReader::read_levels on a reference
     // physical child so IcebergTableReader can synthesize missing nested values
@@ -279,27 +275,22 @@ Status ParquetReader::_read_levels_only_columns(ParquetScanState* state,
 }
 
 Status ParquetReader::_attach_row_positions(ParquetScanState* state,
-                                            const ParquetRowGroupTask& row_group,
-                                            PhysicalReadBatch* batch) {
+                                            const ParquetRowGroupTask& row_group, Block* block) {
     if (!scan_properties.need_row_positions) {
         return Status::OK();
     }
-    batch->row_positions.clear();
-    batch->row_positions.reserve(batch->selection.selected_rows());
-    for (size_t i = 0; i < batch->selection.selected.size(); ++i) {
-        if (batch->selection.selected[i] != 0) {
-            batch->row_positions.push_back(
-                    static_cast<segment_v2::rowid_t>(row_group.first_row + i));
-        }
-    }
+    // Pseudocode:
+    // Add a hidden row-position column to block, aligned with the already
+    // selected rows. IcebergTableReader consumes it for $row_id / row lineage
+    // and removes it during final projection.
     return Status::OK();
 }
 
-Status ParquetReader::_attach_hidden_columns(const ParquetScanState& state,
-                                             PhysicalReadBatch* batch) {
-    for (const auto& field : state.lazy_plan.hidden_fields) {
-        batch->hidden_columns.push_back(field.table_path);
-    }
+Status ParquetReader::_materialize_auxiliary_columns(const ParquetScanState& state, Block* block) {
+    // Pseudocode:
+    // Hidden equality-delete keys, row positions and levels-only columns are
+    // real columns in block. Their hidden nature is derived from
+    // scan_properties.required_fields, not from a side-channel list.
     return Status::OK();
 }
 

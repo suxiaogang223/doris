@@ -88,16 +88,13 @@ private:
     Status _build_virtual_column_plan(IcebergTableReaderScanState* state);
     Status _configure_file_reader(const TableReaderScanTask& task,
                                   IcebergTableReaderScanState* state);
-    Status _finalize_block(IcebergTableReaderScanState* state, PhysicalReadBatch* batch,
-                           Block* block, size_t* read_rows);
-    Status _apply_equality_delete(IcebergTableReaderScanState* state, PhysicalReadBatch* batch);
-    Status _apply_residual_predicates(IcebergTableReaderScanState* state, PhysicalReadBatch* batch);
-    Status _fill_missing_and_partition_columns(IcebergTableReaderScanState* state,
-                                               PhysicalReadBatch* batch);
-    Status _fill_generated_columns(IcebergTableReaderScanState* state, PhysicalReadBatch* batch);
-    Status _fill_row_id_columns(IcebergTableReaderScanState* state, PhysicalReadBatch* batch);
-    Status _project_final_block(IcebergTableReaderScanState* state, PhysicalReadBatch* batch,
-                                Block* block);
+    Status _finalize_block(IcebergTableReaderScanState* state, Block* block, size_t* read_rows);
+    Status _apply_equality_delete(IcebergTableReaderScanState* state, Block* block);
+    Status _apply_residual_predicates(IcebergTableReaderScanState* state, Block* block);
+    Status _fill_missing_and_partition_columns(IcebergTableReaderScanState* state, Block* block);
+    Status _fill_generated_columns(IcebergTableReaderScanState* state, Block* block);
+    Status _fill_row_id_columns(IcebergTableReaderScanState* state, Block* block);
+    Status _project_final_block(IcebergTableReaderScanState* state, Block* block);
 
     ShardedKVCache* _kv_cache = nullptr;
     RuntimeProfile* _profile = nullptr;
