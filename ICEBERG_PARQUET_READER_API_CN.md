@@ -1,73 +1,137 @@
-# Doris Iceberg + Parquet split 驱动组合式 Reader API
+# Doris Iceberg + Parquet DuckDB 风格 Reader API
 
-本文档描述当前实验分支 `experiment/table-reader-composition` 的彻底重写版本。
+本文档描述实验分支 `experiment/table-reader-composition` 当前的 reader API。
 
-这版实验不考虑编译，目标是删除旧的 `ParquetReader` 和 `IcebergReader`
-继承式实现，用伪代码级别的 API 重新表达 Doris BE 中 Iceberg + Parquet
-查询应该如何分层。
+这版实验不考虑编译，目标是把 Doris BE 的 Iceberg + Parquet reader 改成接近
+DuckDB 的分层方式，但命名和执行边界按 Doris 适配。
 
-## 1. Doris 的边界不是 MultiFile，而是 split
+## 1. DuckDB 到 Doris 的角色映射
 
-DuckDB 有 `MultiFileReader` / `MultiFileList`，因为它的 table function
-框架需要在执行侧枚举文件。
+DuckDB 的核心结构是：
 
-Doris 不应该照搬这个概念。Doris 的 Iceberg snapshot、manifest、data file
-枚举和 split 切分应该由 FE 完成。BE 只顺序消费 FE 下发的 `TFileRangeDesc`。
+```text
+MultiFileReader
+  BaseFileReader
+    ParquetReader
+      ParquetReaderScanState
+      ColumnReader tree
+```
 
-因此 BE 里的分层是：
+Doris 不直接照搬 `MultiFile` 命名，因为 BE 不负责 Iceberg 文件枚举。FE 已经完成
+snapshot、manifest、data file 和 split 切分，BE 只消费一个个 `TFileRangeDesc`。
+
+Doris 中对应关系是：
+
+```text
+DuckDB MultiFileReader        -> Doris TableReader
+DuckDB BaseFileReader         -> Doris FileFormatReader
+DuckDB ParquetReaderScanState -> Doris FormatReaderScanState / ParquetScanState
+DuckDB ColumnReader           -> Doris ColumnReader API
+```
+
+运行栈是：
 
 ```text
 FileScanner
   IcebergReaderAdapter
-    IcebergTableReader
-      FileFormatReader
-        ParquetReader
-          ColumnReader API
+    TableReader
+      IcebergTableReader
+        FileFormatReader
+          ParquetReader
+            ParquetScanState
+            ColumnReader tree
 ```
 
 `IcebergReaderAdapter` 只是旧 `FileScanner` 的 `GenericReader` 桥接层，不承载
-Iceberg 语义。
+Iceberg 或 Parquet 语义。
 
-## 2. 核心接口
+## 2. 核心接口职责
 
 ### `TableReader`
 
-表层 reader，输出最终 Doris `Block`。
+`TableReader` 对应 DuckDB 的 `MultiFileReader` 角色，但 Doris 语义是
+“table-format split reader”。
 
-职责：
+它负责：
 
-- schema change
+- 创建具体 table-format scan state
+- 选择并创建 `FileFormatReader`
+- 把 table schema 映射到 file schema
+- 规划 required fields、predicate fields、hidden fields
+- 规划 position delete / deletion vector / equality delete
+- 协调虚拟列、missing/default/generated/synthesized 列
+- 接收 `PhysicalReadBatch` 并输出最终 Doris `Block`
+
+接口：
+
+```cpp
+initialize_scan(TableReaderScanTask, TableReaderScanState*)
+scan(TableReaderScanState*, Block*, size_t*, bool*)
+finish_scan(TableReaderScanState*)
+close()
+```
+
+### `IcebergTableReader`
+
+`IcebergTableReader` 是 `TableReader` 的 Iceberg 实现。
+
+它负责：
+
+- Iceberg field id 优先、name fallback 的 schema mapping
+- rename / reorder / missing / cast
+- nested missing 的 reference levels 规划
 - partition fallback
-- missing/default/generated/synthesized 列
-- equality delete
-- position delete / deletion vector
-- `$row_id`
-- row lineage
-- residual predicate
-- final projection
+- equality delete matcher
+- position delete / deletion vector 到 `RowVisibility`
+- `$row_id`、`_row_id`、`_last_updated_sequence_number`
+- residual predicate 和 final projection
 
 ### `FileFormatReader`
 
-文件格式 reader，输出物理批次 `PhysicalReadBatch`。
+`FileFormatReader` 对应 DuckDB 的 `BaseFileReader`。
 
-职责：
+它只负责物理文件格式，不理解 Iceberg/Hive/Hudi/Paimon 表语义。
 
-- 打开物理文件
-- 读取 footer / schema
-- row group / page pruning
-- predicate column read
+接口：
+
+```cpp
+open()
+physical_schema()
+initialize_scan(FormatScanTask, FormatReaderScanState*)
+scan(FormatReaderScanState*, PhysicalReadBatch*, bool*)
+close()
+```
+
+### `ParquetReader`
+
+`ParquetReader` 是 `FileFormatReader` 的 Parquet 实现。
+
+它负责：
+
+- 读取 footer / physical schema
+- 创建递归 `ColumnReader` tree
+- row group / page / dict / bloom pruning
+- predicate fields 优先读取
 - lazy payload read
-- levels-only read
-- row position 输出
-- hidden physical column 输出
+- levels-only / reference-levels read
+- row positions 输出
+- hidden physical columns 输出
+- prefetch 策略
+
+它不负责：
+
+- Iceberg schema change
+- Iceberg delete file 语义
+- partition/missing/generated 的最终填充
+- final Doris projection
 
 ### `ColumnReader`
 
-列级 API。当前只定义接口，不实现具体解码。
+`ColumnReader` API 对齐 DuckDB 的能力边界。
 
-职责边界：
+核心方法：
 
-- `open`
+- `initialize_read`
 - `read`
 - `filter`
 - `select`
@@ -75,124 +139,86 @@ Iceberg 语义。
 - `read_levels`
 - `register_prefetch`
 
-## 3. 关键数据结构
+延时物化是否成立，关键就在 `filter/select/skip` 是否能下沉到列 reader。
 
-### `TableReadTask`
+## 3. Scan State
 
-表层输入，代表一个 FE 切好的 split。
+### `TableReaderScanState`
 
-包含：
-
-- `tuple_descriptor`
-- `output_slots`
-- `read_context`
-
-### `FormatScanTask`
-
-表层传给文件层的物理读取任务。
+表层 scan 的可变状态，类似 DuckDB table function local scan state。
 
 包含：
 
-- `path`
-- `split_start`
-- `split_size`
-- `schema_mapping_root`
-- `required_fields`
-- `predicates`
-- `row_visibility`
-- `virtual_columns`
-- `need_row_positions`
-- `physical_read_template`
+- `TableReaderScanTask`
+- `FormatReaderScanState`
+- scan 是否结束
 
-### `PhysicalReadBatch`
+### `IcebergTableReaderScanState`
 
-文件层输出。
+Iceberg 的具体表层状态。
 
 包含：
 
-- `physical_block`
-- `selection`
-- `row_positions`
-- `hidden_columns`
-- `physical_rows`
+- 当前 split 的 Iceberg 元信息
+- schema mapping
+- delete plan
+- required fields
+- virtual column plan
+- format scan task
+- file format reader
 
-### `FieldMappingNode`
+### `FormatReaderScanState`
 
-递归 schema mapping。
+文件层 scan 的抽象状态。
 
-表达：
+### `ParquetScanState`
 
-- table path
-- file path
-- Iceberg field id
-- physical Parquet column id range
-- missing / partition / generated / synthesized
-- cast plan
-- nested children
+Parquet 的具体文件层状态，对应 DuckDB `ParquetReaderScanState`。
 
-### `RequiredField`
+包含：
 
-描述文件层为什么需要读某个字段。
-
-用途包括：
-
-- `OUTPUT`
-- `PREDICATE`
-- `EQUALITY_DELETE_KEY`
-- `ROW_ID`
-- `ROW_LINEAGE`
-- `LEVELS_ONLY`
-- `REFERENCE_LEVELS`
-
-### `RowVisibility`
-
-描述行级可见性。
-
-来源：
-
-- position delete
-- deletion vector
-- split row range
-
-`RowVisibility` 必须在 Parquet lazy payload read 前生效，避免被删除的行触发
-payload 读取。
+- 当前 row group
+- row group 内 offset
+- row group first row
+- selection
+- lazy read plan
+- output template
+- root `ColumnReader` tree（伪代码）
+- define/repeat level buffers（伪代码）
+- prefetch 状态
 
 ## 4. 执行流程
 
-### 4.1 `IcebergTableReader::open`
+### 4.1 `IcebergTableReader::initialize_scan`
 
-伪代码流程：
-
-1. 从 `TFileRangeDesc` 读取当前 split 的 Iceberg 元信息
-2. 创建 `ParquetReader`
-3. 调用 `ParquetReader::load_physical_schema`
-4. 构造递归 `FieldMappingNode`
+1. 从 `TFileRangeDesc` 提取当前 split 的 Iceberg 元信息
+2. 根据文件格式创建 `FileFormatReader`，当前实验只创建 `ParquetReader`
+3. `ParquetReader::open()` 读取 footer 和 physical schema
+4. `IcebergTableReader` 基于 physical schema 构造 `FieldMappingNode`
 5. 构造 `IcebergDeletePlan`
 6. 构造 `RequiredField`
 7. 构造 `VirtualColumnPlan`
-8. 组装 `FormatScanTask`
-9. 调用 `ParquetReader::open`
+8. 构造 `FormatScanTask`
+9. 创建 `ParquetScanState`
+10. 调用 `ParquetReader::initialize_scan`
 
-### 4.2 `ParquetReader::next_batch`
+### 4.2 `ParquetReader::scan`
 
-伪代码流程：
-
-1. 选择下一个 row group
+1. 使用 `ParquetScanState` 推进 row group
 2. 做 row group / page pruning
-3. 应用 `RowVisibility`
-4. 读取 predicate fields
-5. 物化 predicate virtual columns
-6. 计算 selection
-7. 按 selection lazy 读取 payload fields
-8. 读取 levels-only/reference-level fields
-9. 输出 row positions
-10. 输出 hidden equality-delete key columns
+3. 注册 prefetch
+4. 应用 `RowVisibility`
+5. 读取 predicate fields
+6. 物化 predicate virtual columns
+7. 计算 selection
+8. 对 payload fields 调用 `ColumnReader::select`
+9. 对全过滤 payload 调用 `ColumnReader::skip`
+10. 读取 levels-only/reference-level fields
+11. 输出 row positions 和 hidden columns
 
-### 4.3 `IcebergTableReader::next_block`
+### 4.3 `IcebergTableReader::scan`
 
-伪代码流程：
-
-1. 接收 `PhysicalReadBatch`
+1. 调用 `FileFormatReader::scan` 得到 `PhysicalReadBatch`
 2. 应用 equality delete
 3. 应用 residual predicate
 4. 填充 missing / partition columns
@@ -205,38 +231,49 @@ payload 读取。
 
 ### 延时物化
 
-`RequiredField` 把 predicate 和 payload 分开。`ParquetReader` 先读 predicate，
-再按 selection 读 payload。
+`RequiredField` 把 predicate、payload、hidden、levels-only 字段分开。
+
+`ParquetReader` 先对 predicate fields 执行 `ColumnReader::filter`，然后只对 surviving
+rows 的 payload fields 执行 `ColumnReader::select`。如果 selection 为空，payload
+列只执行 `skip`。
 
 ### schema change
 
-`FieldMappingNode` 是递归树，不是平铺 map。它能表达 rename、reorder、missing、
-cast 和 nested mapping。
+`PhysicalFileSchema` 是纯 Parquet 物理 schema。
+
+`FieldMappingNode` 是 Iceberg table schema 到 physical schema 的递归映射，支持：
+
+- field id 匹配
+- name fallback
+- rename / reorder
+- missing
+- nested missing
+- cast plan
 
 ### nested missing
 
-nested missing 通过 `REFERENCE_LEVELS` 或 `LEVELS_ONLY` 读取物理 sibling 的
-definition/repetition levels。表层填充时按 nested element cardinality，而不是按
-顶层 row count。
+nested missing 通过 `REFERENCE_LEVELS` 或 `LEVELS_ONLY` 请求物理 sibling 的
+definition/repetition levels。表层填充时按 nested element cardinality，不按顶层
+row count。
 
 ### position delete / deletion vector
 
-它们被压成 `RowVisibility`，在 payload lazy read 前参与 selection。
+它们被转换为 `RowVisibility`，在 payload lazy read 前参与 selection。
 
 ### equality delete
 
-equality delete key 被作为 hidden `RequiredField` 读取。表层 finalize 时过滤并
-删除 hidden columns。
+equality delete key 被加入 hidden `RequiredField`。`ParquetReader` 像读普通物理列
+一样读 hidden key，`IcebergTableReader` 在 finalization 阶段过滤并删除 hidden 列。
 
 ### row id / lineage
 
-`FormatScanTask::need_row_positions` 要求文件层返回 `row_positions`。表层使用
-row position 和 split metadata 生成 `$row_id`、`_row_id`、
+`FormatScanTask::need_row_positions` 要求文件层返回 `row_positions`。`IcebergTableReader`
+结合 split metadata 生成 `$row_id`、`_row_id`、
 `_last_updated_sequence_number`。
 
 ## 6. 当前实验状态
 
-当前版本有意删除旧实现并使用伪代码重写。
+当前版本有意删除旧实现并使用伪代码级 API 重写。
 
 不保证：
 
@@ -246,7 +283,8 @@ row position 和 split metadata 生成 `$row_id`、`_row_id`、
 
 保证表达：
 
-- Doris BE 的 split 驱动边界
-- Iceberg table semantics 和 Parquet physical read 的组合关系
-- 延时物化、schema change、delete、row id 能通过新 API 承载
-
+- Doris 版 `TableReader` 对应 DuckDB `MultiFileReader` 的编排职责
+- `IcebergTableReader` 是 `TableReader` 子类
+- `ParquetReader` 是纯物理 `FileFormatReader`
+- scan cursor 和 reader 元信息分离
+- 延时物化、schema change、delete、row id 可以通过新 API 承载

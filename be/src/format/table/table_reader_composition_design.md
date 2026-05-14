@@ -1,20 +1,27 @@
-# Split-driven Iceberg + Parquet reader composition experiment
+# DuckDB-style Iceberg + Parquet reader composition experiment
 
 This experiment intentionally removes the old `IcebergReaderMixin<ParquetReader>`
 inheritance design from the Iceberg + Parquet path.
 
 Doris BE does not own Iceberg file enumeration. FE resolves the Iceberg snapshot,
 manifests and data files, then sends BE a sequence of `TFileRangeDesc` splits.
-Therefore the BE reader boundary is one split, not a multi-file planning layer.
+Therefore the BE reader boundary is one split, but the API role still mirrors
+DuckDB:
+
+- DuckDB `MultiFileReader` -> Doris `TableReader`
+- DuckDB `BaseFileReader` -> Doris `FileFormatReader`
+- DuckDB `ParquetReaderScanState` -> Doris `ParquetScanState`
 
 ## Runtime stack
 
 ```text
 FileScanner
   IcebergReaderAdapter              // GenericReader bridge only
-    IcebergTableReader              // table-format semantics for one split
+    TableReader
+      IcebergTableReader            // table-format semantics for one split
       FileFormatReader
         ParquetReader               // physical Parquet split reader
+          ParquetScanState
           ColumnReader API          // column/page/level decoding boundary
 ```
 
@@ -40,7 +47,21 @@ FileScanner
 - hidden physical columns requested by the table layer
 
 `ColumnReader` is only an API in this experiment. It is the future home for
-page decoding, level reads, skip/select and prefetch.
+page decoding, level reads, filter/select/skip and prefetch.
+
+## Scan state split
+
+Reader objects hold file/table metadata. Scan state objects hold mutable scan
+cursors.
+
+`IcebergTableReaderScanState` owns the split context, schema mapping, delete
+plan, required fields, virtual column plan, the selected `FileFormatReader` and
+its `FormatReaderScanState`.
+
+`ParquetScanState` owns row-group cursor state, selection, lazy read plan,
+output template, and pseudocode placeholders for the recursive `ColumnReader`
+tree plus definition/repetition level buffers. This follows DuckDB's
+`ParquetReaderScanState` shape.
 
 ## Lazy materialization contract
 
@@ -54,10 +75,12 @@ page decoding, level reads, skip/select and prefetch.
 - `LEVELS_ONLY`
 - `REFERENCE_LEVELS`
 
-`ParquetReader` must read predicate fields first, materialize predicate virtual
-columns, evaluate selection, and then read payload fields only for selected
-rows. Position deletes and deletion vectors are represented as `RowVisibility`
-and are applied before payload lazy reads.
+`ParquetReader` must call `ColumnReader::filter` for predicate fields first,
+materialize predicate virtual columns, evaluate selection, and then call
+`ColumnReader::select` for payload fields only for selected rows. If no rows
+survive, payload readers use `ColumnReader::skip`. Position deletes and
+deletion vectors are represented as `RowVisibility` and are applied before
+payload lazy reads.
 
 ## Schema change contract
 

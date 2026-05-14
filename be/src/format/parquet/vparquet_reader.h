@@ -36,7 +36,6 @@ class RuntimeProfile;
 class RuntimeState;
 class TFileRangeDesc;
 class TFileScanRangeParams;
-class TupleDescriptor;
 
 namespace cctz {
 class time_zone;
@@ -66,36 +65,55 @@ struct ParquetLazyReadPlan {
     std::vector<RequiredField> hidden_fields;
 };
 
+struct ParquetScanState final : public FormatReaderScanState {
+    int32_t current_row_group = -1;
+    int64_t offset_in_row_group = 0;
+    int64_t row_group_first_row = 0;
+    bool current_row_group_prefetched = false;
+    ParquetLazyReadPlan lazy_plan;
+    Block output_template;
+
+    // Pseudocode placeholders matching DuckDB ParquetReaderScanState:
+    //   root_reader: recursive ColumnReader tree
+    //   define_buf / repeat_buf: reusable level buffers
+    //   scan_filters: predicate fields with per-filter state
+};
+
 class ParquetReader final : public FileFormatReader {
 public:
     ParquetReader(RuntimeProfile* profile, const TFileScanRangeParams& params,
                   const TFileRangeDesc& range, size_t batch_size, const cctz::time_zone* ctz,
                   io::IOContext* io_ctx, RuntimeState* state, FileMetaCache* meta_cache);
 
-    Status open(const FormatScanTask& task) override;
-    Status set_output_template(const Block& block) override;
-    Status next_batch(PhysicalReadBatch* batch, bool* eof) override;
+    Status open() override;
     const PhysicalFileSchema& physical_schema() const override { return _footer.schema; }
+    Status initialize_scan(const FormatScanTask& task, FormatReaderScanState* state) override;
+    Status scan(FormatReaderScanState* state, PhysicalReadBatch* batch, bool* eof) override;
     Status close() override;
-
-    // Metadata-only entry used by table readers to build schema mapping before
-    // creating the physical scan task.
-    Status load_physical_schema(PhysicalFileSchema* schema);
 
 private:
     Status _open_footer();
-    Status _build_lazy_read_plan();
-    Status _next_row_group(ParquetRowGroupTask* row_group, bool* eof);
-    Status _apply_row_group_pruning(ParquetRowGroupTask* row_group);
-    Status _apply_row_visibility(ParquetRowGroupTask* row_group);
-    Status _read_predicate_columns(const ParquetRowGroupTask& row_group, PhysicalReadBatch* batch);
-    Status _materialize_predicate_virtual_columns(PhysicalReadBatch* batch);
-    Status _evaluate_predicates(PhysicalReadBatch* batch);
-    Status _read_payload_columns(const ParquetRowGroupTask& row_group, PhysicalReadBatch* batch);
-    Status _read_levels_only_columns(const ParquetRowGroupTask& row_group,
+    Status _build_lazy_read_plan(const FormatScanTask& task, ParquetLazyReadPlan* plan);
+    Status _create_column_reader_tree(const FormatScanTask& task, ParquetScanState* state);
+    Status _scan_internal(ParquetScanState* state, PhysicalReadBatch* batch, bool* produced,
+                          bool* eof);
+    Status _switch_row_group(ParquetScanState* state, bool* eof);
+    Status _prepare_row_group(ParquetScanState* state);
+    Status _register_prefetch(ParquetScanState* state);
+    Status _apply_row_group_pruning(ParquetScanState* state);
+    Status _apply_row_visibility(ParquetScanState* state, ParquetRowGroupTask* row_group);
+    Status _read_predicate_columns(ParquetScanState* state, const ParquetRowGroupTask& row_group,
+                                   PhysicalReadBatch* batch);
+    Status _materialize_predicate_virtual_columns(ParquetScanState* state,
+                                                  PhysicalReadBatch* batch);
+    Status _evaluate_predicates(ParquetScanState* state, PhysicalReadBatch* batch);
+    Status _read_payload_columns(ParquetScanState* state, const ParquetRowGroupTask& row_group,
+                                 PhysicalReadBatch* batch);
+    Status _read_levels_only_columns(ParquetScanState* state, const ParquetRowGroupTask& row_group,
                                      PhysicalReadBatch* batch);
-    Status _attach_row_positions(const ParquetRowGroupTask& row_group, PhysicalReadBatch* batch);
-    Status _attach_hidden_columns(PhysicalReadBatch* batch);
+    Status _attach_row_positions(ParquetScanState* state, const ParquetRowGroupTask& row_group,
+                                 PhysicalReadBatch* batch);
+    Status _attach_hidden_columns(const ParquetScanState& state, PhysicalReadBatch* batch);
 
     RuntimeProfile* _profile = nullptr;
     const TFileScanRangeParams& _params;
@@ -106,11 +124,7 @@ private:
     RuntimeState* _state = nullptr;
     FileMetaCache* _meta_cache = nullptr;
 
-    std::optional<FormatScanTask> _task;
     ParquetFooter _footer;
-    ParquetLazyReadPlan _lazy_plan;
-    Block _output_template;
-    int32_t _next_row_group_id = 0;
     bool _closed = false;
 };
 

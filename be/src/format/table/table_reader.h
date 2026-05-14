@@ -40,6 +40,16 @@ class RuntimeState;
 class SlotDescriptor;
 class TupleDescriptor;
 
+// This file intentionally mirrors DuckDB's reader split while using Doris names:
+//
+//   DuckDB MultiFileReader      -> Doris TableReader
+//   DuckDB BaseFileReader       -> Doris FileFormatReader
+//   DuckDB ParquetReaderScanState -> Doris FormatReaderScanState subclasses
+//
+// Doris BE does not enumerate files. FE already resolves table snapshots,
+// manifests, data files and splits. TableReader therefore orchestrates one
+// FE-planned split at a time instead of owning a multi-file list.
+
 enum class FieldMappingKind {
     PHYSICAL,
     MISSING,
@@ -71,7 +81,7 @@ struct CastPlan {
 };
 
 struct PhysicalFieldRef {
-    std::string parquet_path;
+    std::string file_path;
     int32_t field_id = -1;
     uint64_t column_id = 0;
     uint64_t max_column_id = 0;
@@ -80,7 +90,7 @@ struct PhysicalFieldRef {
 struct FieldMappingNode {
     std::string table_path;
     std::string file_path;
-    int32_t iceberg_field_id = -1;
+    int32_t table_field_id = -1;
     FieldMappingKind kind = FieldMappingKind::MISSING;
     std::optional<PhysicalFieldRef> physical;
     std::optional<CastPlan> cast_plan;
@@ -157,7 +167,7 @@ struct FileReadContext {
 
 struct PhysicalFileSchema {
     FieldMappingNode root;
-    bool has_iceberg_field_ids = false;
+    bool has_field_ids = false;
 };
 
 struct FormatScanTask {
@@ -182,42 +192,73 @@ struct PhysicalReadBatch {
     size_t physical_rows = 0;
 };
 
+struct ColumnReadContext {
+    RequiredField field;
+    FieldMappingNode mapping;
+    int32_t row_group_id = -1;
+};
+
 class ColumnReader {
 public:
     virtual ~ColumnReader() = default;
 
-    virtual Status open(const RequiredField& field, const FieldMappingNode& mapping) = 0;
-    virtual Status read(Block* block, size_t rows, const SelectionVector* selection) = 0;
-    virtual Status filter(Block* block, SelectionVector* selection) = 0;
-    virtual Status select(const SelectionVector& selection) = 0;
+    virtual Status initialize_read(const ColumnReadContext& context) = 0;
+    virtual Status read(size_t rows, Block* block) = 0;
+    virtual Status filter(size_t rows, Block* block, SelectionVector* selection,
+                          size_t* selected_rows) = 0;
+    virtual Status select(size_t rows, const SelectionVector& selection, size_t selected_rows,
+                          Block* block) = 0;
     virtual Status skip(size_t rows) = 0;
-    virtual Status read_levels(Block* block, size_t rows) = 0;
-    virtual Status register_prefetch(size_t row_group, size_t page_index) = 0;
+    virtual Status read_levels(size_t rows, Block* block) = 0;
+    virtual Status register_prefetch(size_t row_group, size_t page_index, bool allow_merge) = 0;
+};
+
+struct FormatReaderScanState {
+    virtual ~FormatReaderScanState() = default;
+
+    FormatScanTask task;
+    SelectionVector selection;
+    bool finished = false;
 };
 
 class FileFormatReader {
 public:
     virtual ~FileFormatReader() = default;
 
-    virtual Status open(const FormatScanTask& task) = 0;
-    virtual Status set_output_template(const Block& block) = 0;
-    virtual Status next_batch(PhysicalReadBatch* batch, bool* eof) = 0;
+    virtual Status open() = 0;
     virtual const PhysicalFileSchema& physical_schema() const = 0;
+    virtual Status initialize_scan(const FormatScanTask& task, FormatReaderScanState* state) = 0;
+    virtual Status scan(FormatReaderScanState* state, PhysicalReadBatch* batch, bool* eof) = 0;
     virtual Status close() = 0;
 };
 
-struct TableReadTask {
+struct TableReaderOptions {
     const TupleDescriptor* tuple_descriptor = nullptr;
     std::vector<SlotDescriptor*> output_slots;
     FileReadContext read_context;
+};
+
+struct TableReaderScanTask {
+    TableReaderOptions options;
+};
+
+struct TableReaderScanState {
+    virtual ~TableReaderScanState() = default;
+
+    TableReaderScanTask task;
+    std::unique_ptr<FormatReaderScanState> format_state;
+    bool finished = false;
 };
 
 class TableReader {
 public:
     virtual ~TableReader() = default;
 
-    virtual Status open(const TableReadTask& task) = 0;
-    virtual Status next_block(Block* block, size_t* read_rows, bool* eof) = 0;
+    virtual Status initialize_scan(const TableReaderScanTask& task,
+                                   TableReaderScanState* state) = 0;
+    virtual Status scan(TableReaderScanState* state, Block* block, size_t* read_rows,
+                        bool* eof) = 0;
+    virtual Status finish_scan(TableReaderScanState* state) = 0;
     virtual Status close() = 0;
 };
 

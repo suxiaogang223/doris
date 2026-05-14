@@ -35,52 +35,40 @@ ParquetReader::ParquetReader(RuntimeProfile* profile, const TFileScanRangeParams
           _state(state),
           _meta_cache(meta_cache) {}
 
-Status ParquetReader::open(const FormatScanTask& task) {
-    _task = task;
+Status ParquetReader::open() {
     RETURN_IF_ERROR(_open_footer());
-    RETURN_IF_ERROR(_build_lazy_read_plan());
-    _next_row_group_id = 0;
     return Status::OK();
 }
 
-Status ParquetReader::set_output_template(const Block& block) {
-    _output_template = block;
+Status ParquetReader::initialize_scan(const FormatScanTask& task, FormatReaderScanState* state) {
+    auto* parquet_state = static_cast<ParquetScanState*>(state);
+    parquet_state->task = task;
+    parquet_state->finished = false;
+    parquet_state->current_row_group = -1;
+    parquet_state->offset_in_row_group = 0;
+    parquet_state->row_group_first_row = 0;
+    parquet_state->current_row_group_prefetched = false;
+    parquet_state->output_template = task.physical_read_template;
+
+    RETURN_IF_ERROR(_build_lazy_read_plan(task, &parquet_state->lazy_plan));
+    RETURN_IF_ERROR(_create_column_reader_tree(task, parquet_state));
     return Status::OK();
 }
 
-Status ParquetReader::next_batch(PhysicalReadBatch* batch, bool* eof) {
-    DORIS_CHECK(_task.has_value());
-    batch->physical_block = _output_template;
-    batch->hidden_columns.clear();
-    batch->row_positions.clear();
-    batch->physical_rows = 0;
-
-    ParquetRowGroupTask row_group;
-    RETURN_IF_ERROR(_next_row_group(&row_group, eof));
-    if (*eof) {
-        return Status::OK();
+Status ParquetReader::scan(FormatReaderScanState* state, PhysicalReadBatch* batch, bool* eof) {
+    auto* parquet_state = static_cast<ParquetScanState*>(state);
+    while (true) {
+        bool produced = false;
+        RETURN_IF_ERROR(_scan_internal(parquet_state, batch, &produced, eof));
+        if (*eof || produced) {
+            return Status::OK();
+        }
+        batch->physical_block.clear();
     }
-
-    RETURN_IF_ERROR(_apply_row_group_pruning(&row_group));
-    RETURN_IF_ERROR(_apply_row_visibility(&row_group));
-    RETURN_IF_ERROR(_read_predicate_columns(row_group, batch));
-    RETURN_IF_ERROR(_materialize_predicate_virtual_columns(batch));
-    RETURN_IF_ERROR(_evaluate_predicates(batch));
-    RETURN_IF_ERROR(_read_payload_columns(row_group, batch));
-    RETURN_IF_ERROR(_read_levels_only_columns(row_group, batch));
-    RETURN_IF_ERROR(_attach_row_positions(row_group, batch));
-    RETURN_IF_ERROR(_attach_hidden_columns(batch));
-    return Status::OK();
 }
 
 Status ParquetReader::close() {
     _closed = true;
-    return Status::OK();
-}
-
-Status ParquetReader::load_physical_schema(PhysicalFileSchema* schema) {
-    RETURN_IF_ERROR(_open_footer());
-    *schema = _footer.schema;
     return Status::OK();
 }
 
@@ -90,140 +78,210 @@ Status ParquetReader::_open_footer() {
     }
 
     // Pseudocode:
-    // 1. Open _range.path through FileFactory.
-    // 2. Read Parquet footer, row group metadata, column chunk metadata.
-    // 3. Build a recursive PhysicalFileSchema from Parquet schema nodes.
-    // 4. Preserve Parquet field ids when present.
+    // 1. Open _range.path through FileFactory and Doris IOContext.
+    // 2. Read Parquet footer, row group metadata, page index and column chunks.
+    // 3. Build a recursive PhysicalFileSchema with schema index, column index,
+    //    field id, max definition level and max repetition level.
+    // 4. Keep this physical schema independent from any table-format schema
+    //    mapping. IcebergTableReader will consume it later.
     _footer.schema.root.table_path = "$root";
     _footer.schema.root.file_path = "$root";
     _footer.schema.root.kind = FieldMappingKind::PHYSICAL;
-    _footer.schema.has_iceberg_field_ids = true;
+    _footer.schema.has_field_ids = true;
     _footer.total_rows = 0;
     _footer.row_group_first_rows.clear();
     return Status::OK();
 }
 
-Status ParquetReader::_build_lazy_read_plan() {
-    DORIS_CHECK(_task.has_value());
-    _lazy_plan = ParquetLazyReadPlan {};
-    for (const auto& field : _task->required_fields) {
+Status ParquetReader::_build_lazy_read_plan(const FormatScanTask& task, ParquetLazyReadPlan* plan) {
+    *plan = ParquetLazyReadPlan {};
+    for (const auto& field : task.required_fields) {
         if (field.purpose == RequiredFieldPurpose::PREDICATE) {
-            _lazy_plan.predicate_fields.push_back(field);
+            plan->predicate_fields.push_back(field);
         } else if (field.purpose == RequiredFieldPurpose::LEVELS_ONLY ||
                    field.purpose == RequiredFieldPurpose::REFERENCE_LEVELS) {
-            _lazy_plan.levels_only_fields.push_back(field);
+            plan->levels_only_fields.push_back(field);
         } else if (field.hidden) {
-            _lazy_plan.hidden_fields.push_back(field);
+            plan->hidden_fields.push_back(field);
         } else {
-            _lazy_plan.payload_fields.push_back(field);
+            plan->payload_fields.push_back(field);
         }
     }
     return Status::OK();
 }
 
-Status ParquetReader::_next_row_group(ParquetRowGroupTask* row_group, bool* eof) {
-    DORIS_CHECK(_task.has_value());
+Status ParquetReader::_create_column_reader_tree(const FormatScanTask& task,
+                                                 ParquetScanState* state) {
+    // Pseudocode, directly aligned with DuckDB CreateReaderRecursive:
+    //
+    // Build a recursive ColumnReader tree from task.schema_mapping_root and the
+    // physical Parquet schema. Leaf readers decode pages. Struct/list/map
+    // readers own children and preserve definition/repetition level semantics.
+    // Expression/virtual readers are wrappers only when the physical layer can
+    // safely evaluate them before lazy payload reads.
+    return Status::OK();
+}
 
-    // Pseudocode:
-    // Iterate row groups intersecting [_task->split_start, _task->split_start + split_size).
-    // The real implementation should also honor byte split boundaries and empty files.
-    if (_next_row_group_id >= static_cast<int32_t>(_footer.row_group_first_rows.size())) {
+Status ParquetReader::_scan_internal(ParquetScanState* state, PhysicalReadBatch* batch,
+                                     bool* produced, bool* eof) {
+    *produced = false;
+    *eof = false;
+    if (state->finished) {
         *eof = true;
         return Status::OK();
     }
 
-    row_group->row_group_id = _next_row_group_id++;
-    row_group->first_row = _footer.row_group_first_rows[row_group->row_group_id];
-    row_group->row_count = _batch_size;
-    row_group->candidate_rows.reset(row_group->row_count, true);
+    if (state->current_row_group < 0) {
+        RETURN_IF_ERROR(_switch_row_group(state, eof));
+        if (*eof) {
+            return Status::OK();
+        }
+        return Status::OK();
+    }
+
+    batch->physical_block = state->output_template;
+    batch->hidden_columns.clear();
+    batch->row_positions.clear();
+    batch->physical_rows = 0;
+
+    ParquetRowGroupTask row_group;
+    row_group.row_group_id = state->current_row_group;
+    row_group.first_row = state->row_group_first_row + state->offset_in_row_group;
+    row_group.row_count = _batch_size;
+    row_group.candidate_rows.reset(row_group.row_count, true);
+
+    RETURN_IF_ERROR(_apply_row_visibility(state, &row_group));
+    RETURN_IF_ERROR(_read_predicate_columns(state, row_group, batch));
+    RETURN_IF_ERROR(_materialize_predicate_virtual_columns(state, batch));
+    RETURN_IF_ERROR(_evaluate_predicates(state, batch));
+    RETURN_IF_ERROR(_read_payload_columns(state, row_group, batch));
+    RETURN_IF_ERROR(_read_levels_only_columns(state, row_group, batch));
+    RETURN_IF_ERROR(_attach_row_positions(state, row_group, batch));
+    RETURN_IF_ERROR(_attach_hidden_columns(*state, batch));
+
+    state->offset_in_row_group += row_group.row_count;
+    *produced = batch->physical_rows > 0;
+    return Status::OK();
+}
+
+Status ParquetReader::_switch_row_group(ParquetScanState* state, bool* eof) {
+    ++state->current_row_group;
+    state->offset_in_row_group = 0;
+    state->current_row_group_prefetched = false;
+
+    if (state->current_row_group >= static_cast<int32_t>(_footer.row_group_first_rows.size())) {
+        state->finished = true;
+        *eof = true;
+        return Status::OK();
+    }
+
+    state->row_group_first_row = _footer.row_group_first_rows[state->current_row_group];
+    RETURN_IF_ERROR(_prepare_row_group(state));
     *eof = false;
     return Status::OK();
 }
 
-Status ParquetReader::_apply_row_group_pruning(ParquetRowGroupTask* row_group) {
+Status ParquetReader::_prepare_row_group(ParquetScanState* state) {
+    RETURN_IF_ERROR(_apply_row_group_pruning(state));
+    RETURN_IF_ERROR(_register_prefetch(state));
+
     // Pseudocode:
-    // 1. Use min/max, bloom filter and page index for predicate physical fields.
-    // 2. Update row_group->candidate_rows for page-level pruning.
-    // 3. Do not use table-level virtual columns here.
+    // root_reader->InitializeRead(current_row_group, column_chunks, thrift_proto)
     return Status::OK();
 }
 
-Status ParquetReader::_apply_row_visibility(ParquetRowGroupTask* row_group) {
-    DORIS_CHECK(_task.has_value());
-    if (!_task->row_visibility.needs_row_positions()) {
+Status ParquetReader::_register_prefetch(ParquetScanState* state) {
+    // Pseudocode:
+    // 1. Estimate row group span and compressed bytes for required physical
+    //    columns.
+    // 2. If scan ratio is high and no filters exist, prefetch the whole row
+    //    group.
+    // 3. Otherwise register column-wise ranges. In lazy mode, prefetch predicate
+    //    columns eagerly and payload columns only when selected rows survive.
+    return Status::OK();
+}
+
+Status ParquetReader::_apply_row_group_pruning(ParquetScanState* state) {
+    // Pseudocode:
+    // Use min/max, bloom filter, dictionary and page index for physical
+    // predicate fields. This can finish the row group without invoking payload
+    // column readers.
+    return Status::OK();
+}
+
+Status ParquetReader::_apply_row_visibility(ParquetScanState* state,
+                                            ParquetRowGroupTask* row_group) {
+    if (!state->task.row_visibility.needs_row_positions()) {
         return Status::OK();
     }
     for (size_t i = 0; i < row_group->candidate_rows.selected.size(); ++i) {
         const int64_t file_row = row_group->first_row + static_cast<int64_t>(i);
-        if (!_task->row_visibility.is_visible(file_row)) {
+        if (!state->task.row_visibility.is_visible(file_row)) {
             row_group->candidate_rows.selected[i] = 0;
         }
     }
     return Status::OK();
 }
 
-Status ParquetReader::_read_predicate_columns(const ParquetRowGroupTask& row_group,
+Status ParquetReader::_read_predicate_columns(ParquetScanState* state,
+                                              const ParquetRowGroupTask& row_group,
                                               PhysicalReadBatch* batch) {
     // Pseudocode:
-    // For each predicate field:
-    //   ColumnReader reader = open_column(field.mapping)
-    //   reader.read(batch->physical_block, row_group.row_count, &row_group.candidate_rows)
-    //
-    // Complex predicate fields may also read levels so filters preserve nested
-    // cardinality.
+    // for field in state->lazy_plan.predicate_fields:
+    //   child_reader.Filter(row_group.row_count, levels, vector, predicate,
+    //                       filter_state, selection, selected_rows)
     batch->physical_rows = row_group.candidate_rows.selected_rows();
     batch->selection = row_group.candidate_rows;
     return Status::OK();
 }
 
-Status ParquetReader::_materialize_predicate_virtual_columns(PhysicalReadBatch* batch) {
-    DORIS_CHECK(_task.has_value());
-    for (const auto& [_, handler] : _task->virtual_columns.predicate_virtual_columns) {
+Status ParquetReader::_materialize_predicate_virtual_columns(ParquetScanState* state,
+                                                             PhysicalReadBatch* batch) {
+    for (const auto& [_, handler] : state->task.virtual_columns.predicate_virtual_columns) {
         RETURN_IF_ERROR(handler(&batch->physical_block, batch->physical_rows, &batch->selection));
     }
     return Status::OK();
 }
 
-Status ParquetReader::_evaluate_predicates(PhysicalReadBatch* batch) {
+Status ParquetReader::_evaluate_predicates(ParquetScanState* state, PhysicalReadBatch* batch) {
     // Pseudocode:
-    // 1. Evaluate vectorized predicates on predicate physical columns and
-    //    predicate virtual columns.
-    // 2. Intersect the result into batch->selection.
-    // 3. The final selection controls payload lazy materialization.
+    // Intersect vectorized predicate results into batch->selection. Adaptive
+    // predicate ordering belongs to scan state, as in DuckDB's AdaptiveFilter.
     return Status::OK();
 }
 
-Status ParquetReader::_read_payload_columns(const ParquetRowGroupTask& row_group,
+Status ParquetReader::_read_payload_columns(ParquetScanState* state,
+                                            const ParquetRowGroupTask& row_group,
                                             PhysicalReadBatch* batch) {
     // Pseudocode:
-    // For each payload field:
-    //   if field.allow_lazy_materialization:
-    //       reader.read(block, row_group.row_count, &batch->selection)
-    //   else:
-    //       reader.read(block, row_group.row_count, nullptr)
+    // if selected_rows == 0:
+    //   payload_reader.Skip(row_group.row_count)
+    // else:
+    //   payload_reader.Select(row_group.row_count, selection, selected_rows, block)
     //
-    // This is the core lazy materialization boundary. Table semantics do not
-    // leak into the column reader.
-    for (const auto& [_, handler] : _task->virtual_columns.payload_virtual_columns) {
+    // This mirrors DuckDB's Filter/Select/Skip boundary and keeps table-format
+    // semantics outside the Parquet reader.
+    for (const auto& [_, handler] : state->task.virtual_columns.payload_virtual_columns) {
         RETURN_IF_ERROR(handler(&batch->physical_block, batch->selection.selected_rows(),
                                 &batch->selection));
     }
     return Status::OK();
 }
 
-Status ParquetReader::_read_levels_only_columns(const ParquetRowGroupTask& row_group,
+Status ParquetReader::_read_levels_only_columns(ParquetScanState* state,
+                                                const ParquetRowGroupTask& row_group,
                                                 PhysicalReadBatch* batch) {
     // Pseudocode:
-    // For nested missing fields, read only repetition/definition levels from a
-    // reference physical child. IcebergTableReader consumes these levels to fill
-    // missing nested children by element cardinality, not by top-level row count.
+    // For nested missing fields, call ColumnReader::read_levels on a reference
+    // physical child so IcebergTableReader can synthesize missing nested values
+    // by element cardinality.
     return Status::OK();
 }
 
-Status ParquetReader::_attach_row_positions(const ParquetRowGroupTask& row_group,
+Status ParquetReader::_attach_row_positions(ParquetScanState* state,
+                                            const ParquetRowGroupTask& row_group,
                                             PhysicalReadBatch* batch) {
-    DORIS_CHECK(_task.has_value());
-    if (!_task->need_row_positions) {
+    if (!state->task.need_row_positions) {
         return Status::OK();
     }
     batch->row_positions.clear();
@@ -237,8 +295,9 @@ Status ParquetReader::_attach_row_positions(const ParquetRowGroupTask& row_group
     return Status::OK();
 }
 
-Status ParquetReader::_attach_hidden_columns(PhysicalReadBatch* batch) {
-    for (const auto& field : _lazy_plan.hidden_fields) {
+Status ParquetReader::_attach_hidden_columns(const ParquetScanState& state,
+                                             PhysicalReadBatch* batch) {
+    for (const auto& field : state.lazy_plan.hidden_fields) {
         batch->hidden_columns.push_back(field.table_path);
     }
     return Status::OK();

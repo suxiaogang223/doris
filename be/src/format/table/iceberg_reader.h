@@ -35,7 +35,6 @@ class RuntimeState;
 class ShardedKVCache;
 class TFileRangeDesc;
 class TFileScanRangeParams;
-class TupleDescriptor;
 
 namespace cctz {
 class time_zone;
@@ -58,6 +57,16 @@ struct IcebergDeletePlan {
     std::vector<RequiredField> equality_delete_fields;
 };
 
+struct IcebergTableReaderScanState final : public TableReaderScanState {
+    IcebergSplitContext split;
+    IcebergDeletePlan delete_plan;
+    FieldMappingNode mapping;
+    std::vector<RequiredField> required_fields;
+    VirtualColumnPlan virtual_columns;
+    FormatScanTask format_task;
+    std::unique_ptr<FileFormatReader> file_reader;
+};
+
 class IcebergTableReader final : public TableReader {
 public:
     IcebergTableReader(ShardedKVCache* kv_cache, RuntimeProfile* profile,
@@ -65,31 +74,31 @@ public:
                        size_t batch_size, const cctz::time_zone* ctz, io::IOContext* io_ctx,
                        RuntimeState* state, FileMetaCache* meta_cache);
 
-    Status open(const TableReadTask& task) override;
-    Status next_block(Block* block, size_t* read_rows, bool* eof) override;
+    Status initialize_scan(const TableReaderScanTask& task, TableReaderScanState* state) override;
+    Status scan(TableReaderScanState* state, Block* block, size_t* read_rows, bool* eof) override;
+    Status finish_scan(TableReaderScanState* state) override;
     Status close() override;
 
 private:
-    Status _load_split_context();
+    Status _load_split_context(IcebergTableReaderScanState* state);
+    Status _create_file_reader(IcebergTableReaderScanState* state);
     Status _build_schema_mapping(const PhysicalFileSchema& physical_schema,
-                                 FieldMappingNode* mapping);
-    Status _build_delete_plan(IcebergDeletePlan* delete_plan);
-    Status _build_required_fields(const FieldMappingNode& mapping,
-                                  const IcebergDeletePlan& delete_plan,
-                                  std::vector<RequiredField>* required_fields);
-    Status _build_virtual_column_plan(VirtualColumnPlan* virtual_columns);
-    Status _build_format_scan_task(const TableReadTask& task, const FieldMappingNode& mapping,
-                                   const IcebergDeletePlan& delete_plan,
-                                   const std::vector<RequiredField>& required_fields,
-                                   const VirtualColumnPlan& virtual_columns,
-                                   FormatScanTask* format_task);
-    Status _finalize_block(PhysicalReadBatch* batch, Block* block, size_t* read_rows);
-    Status _apply_equality_delete(PhysicalReadBatch* batch);
-    Status _apply_residual_predicates(PhysicalReadBatch* batch);
-    Status _fill_missing_and_partition_columns(PhysicalReadBatch* batch);
-    Status _fill_generated_columns(PhysicalReadBatch* batch);
-    Status _fill_row_id_columns(PhysicalReadBatch* batch);
-    Status _project_final_block(PhysicalReadBatch* batch, Block* block);
+                                 IcebergTableReaderScanState* state);
+    Status _build_delete_plan(IcebergTableReaderScanState* state);
+    Status _build_required_fields(IcebergTableReaderScanState* state);
+    Status _build_virtual_column_plan(IcebergTableReaderScanState* state);
+    Status _build_format_scan_task(const TableReaderScanTask& task,
+                                   IcebergTableReaderScanState* state);
+    Status _finalize_block(IcebergTableReaderScanState* state, PhysicalReadBatch* batch,
+                           Block* block, size_t* read_rows);
+    Status _apply_equality_delete(IcebergTableReaderScanState* state, PhysicalReadBatch* batch);
+    Status _apply_residual_predicates(IcebergTableReaderScanState* state, PhysicalReadBatch* batch);
+    Status _fill_missing_and_partition_columns(IcebergTableReaderScanState* state,
+                                               PhysicalReadBatch* batch);
+    Status _fill_generated_columns(IcebergTableReaderScanState* state, PhysicalReadBatch* batch);
+    Status _fill_row_id_columns(IcebergTableReaderScanState* state, PhysicalReadBatch* batch);
+    Status _project_final_block(IcebergTableReaderScanState* state, PhysicalReadBatch* batch,
+                                Block* block);
 
     ShardedKVCache* _kv_cache = nullptr;
     RuntimeProfile* _profile = nullptr;
@@ -100,11 +109,6 @@ private:
     io::IOContext* _io_ctx = nullptr;
     RuntimeState* _state = nullptr;
     FileMetaCache* _meta_cache = nullptr;
-
-    IcebergSplitContext _split;
-    TableReadTask _table_task;
-    std::unique_ptr<FileFormatReader> _file_reader;
-    Block _output_template;
 };
 
 class IcebergReaderAdapter final : public GenericReader {
@@ -122,6 +126,7 @@ protected:
 
 private:
     IcebergTableReader _table_reader;
+    IcebergTableReaderScanState _scan_state;
 };
 
 } // namespace doris
