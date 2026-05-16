@@ -84,6 +84,8 @@ class IcebergTableReader : public reader::TableReader {
 public:
     ~IcebergTableReader() override = default;
 
+    // 再抽象一层，不要直接传TFileScanRangeParams
+    // TODO: TableScanRequest from TFileScanRangeParams，这个缩减为一个init
     Status init(const TFileScanRangeParams& params, const TFileRangeDesc& range,
                 const reader::TableReadOptions& options) override {
         // TableReader 标准入口。Iceberg 专用实现会在 init_iceberg 中注入 ParquetReader。
@@ -93,24 +95,10 @@ public:
         return Status::OK();
     }
 
-    Status init_iceberg(const TFileScanRangeParams& params, const TFileRangeDesc& range,
-                        const IcebergReadOptions& options,
-                        std::unique_ptr<parquet::ParquetReader> data_reader) {
-        // 绑定 Iceberg reader 的运行时参数，并组合底层 ParquetReader。
-        (void)params;
-        (void)range;
-        _options = options;
-        _data_reader = std::move(data_reader);
-        return Status::OK();
-    }
+    // TODO: file_scanner -> splits -> MultiFileReader(TableReader) -> IcebergTableReader -> ParquetReader -> data file
 
-    Status init_scan(const reader::TableScanRequest& request) override {
-        // 保存表层 projection/filter。这里仍然是 table/global schema 语义。
-        _table_scan_request = request;
-        return Status::OK();
-    }
 
-    Status initialize_reader(const IcebergScanTask& task) {
+    Status create_reader(const IcebergScanTask& task) {
         // 伪逻辑：
         // 1. 打开 task.data_file 对应的 Parquet 文件；
         // 2. 从 ParquetReader 获取 file-local columns；
@@ -121,9 +109,9 @@ public:
         // 7. 调用 ParquetReader::init_reader。
         _scan_task = task;
         parquet::ParquetScanRequest parquet_request;
-        std::vector<parquet::ParquetFileColumn> file_columns;
+        std::vector<parquet::SchemaField> file_columns;
         if (_data_reader) {
-            RETURN_IF_ERROR(_data_reader->get_columns(&file_columns));
+            RETURN_IF_ERROR(_data_reader->get_schema(&file_columns));
         }
         reader::TableColumnMapperOptions mapper_options;
         mapper_options.mode = reader::TableColumnMappingMode::BY_FIELD_ID;
@@ -132,7 +120,7 @@ public:
         RETURN_IF_ERROR(_column_mapper.create_scan_request(_table_scan_request, &parquet_request));
         RETURN_IF_ERROR(apply_position_deletes(&parquet_request));
         if (_data_reader) {
-            RETURN_IF_ERROR(_data_reader->init_reader(parquet_request));
+            RETURN_IF_ERROR(_data_reader->init(parquet_request));
         }
         return Status::OK();
     }

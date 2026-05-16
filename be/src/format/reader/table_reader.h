@@ -48,10 +48,29 @@ struct TableColumn {
     std::vector<TableColumn> children;
 };
 
-// 表层过滤条件，仍然按 table schema 组织，后续由 TableReader 解析成文件层条件。
+// 表层过滤条件，仍然按 table schema 组织，后续由 TableColumnMapper 解析成文件层条件。
 struct TableFilter {
+    // filter 关联的 table/global column id。Iceberg 场景下通常是 field id。
     ColumnId table_column_id = -1;
+
+    // 通用表达式谓词，用于表达 ColumnPredicate 无法覆盖的过滤逻辑。
+    // 例如：
+    // - CAST(col AS BIGINT) = 3000000000
+    // - a + b > 1
+    // - complex/nested expression
+    //
+    // conjunct 的执行依赖表达式执行器，通常用于 scan 阶段的行过滤，或者作为
+    // reader_expression_map fallback 的上层表达式来源。它不一定能用于 Parquet
+    // row group stats、page index、dictionary、bloom filter 等物理剪枝。
     VExprContextSPtr conjunct;
+
+    // 列谓词形式的过滤条件，通常是单列比较、IN、IS NULL 等可结构化表达的谓词。
+    // ColumnPredicate 更适合下推到文件层优化：row group statistics、page index、
+    // dictionary filter、bloom filter 等通常依赖这种结构化谓词。
+    //
+    // 同一个 TableFilter 可以同时携带 conjunct 和 predicates：
+    // - predicates 用于尽可能早的文件层剪枝；
+    // - conjunct 用于最终精确过滤，或表达 predicates 无法完整表示的语义。
     std::vector<std::shared_ptr<ColumnPredicate>> predicates;
 };
 
@@ -131,9 +150,22 @@ enum class TableColumnMappingMode {
 };
 
 enum class TableFilterConversion {
+    // table column 和 file column 是 trivial mapping。
+    // filter 可以无语义变化地复制成 file-local filter，文件层 pruning 能力最完整。
     COPY_DIRECTLY,
+
+    // table type 和 file type 不同，但 filter 常量可以安全转换到 file type。
+    // 例如 table BIGINT / file INT / WHERE col = 42，可以把常量转成 INT 后下推。
     CAST_FILTER,
+
+    // filter 不能安全转换成 file-local predicate，但可以在 ParquetReader 内部先计算
+    // reader_filter_expr 临时列，再基于该临时列过滤。该路径通常不能使用 bloom/page
+    // stats 做等价剪枝，但仍能服务延时物化第一阶段的过滤。
     EVALUATE_EXPRESSION,
+
+    // filter 不下推给 ParquetReader。
+    // 常见原因包括：缺失列、partition/generated/default 列、无法表达的复杂谓词，
+    // 或者只能在 table block finalize 后判断的条件。
     FINALIZE_ONLY,
 };
 
@@ -143,11 +175,9 @@ struct TableColumnMapperOptions {
     bool enable_reader_expression_fallback = true;
 };
 
-// TableColumnMapper 对应 DuckDB 的 MultiFileColumnMapper。
-//
-// 它是 table/global schema 和 file-local schema 之间的通用映射组件，不属于
-// Iceberg 专有逻辑。IcebergTableReader 会把 mode 配成 BY_FIELD_ID，Hive/普通
-// multi-file parquet 后续可以选择 BY_NAME。
+// TableColumnMapper 是 Doris table/global schema 和 file-local schema 之间的通用
+// 映射组件，不属于 Iceberg 专有逻辑。IcebergTableReader 会把 mode 配成
+// BY_FIELD_ID，Hive/普通 multi-file parquet 后续可以选择 BY_NAME。
 //
 // 该组件负责：
 // 1. 建立 table column -> file column 的映射；
@@ -156,6 +186,9 @@ struct TableColumnMapperOptions {
 // 4. 将 table filter 转换成 file-local filter；
 // 5. 无法安全本地化的 filter 通过 reader_expression_map 交给 ParquetReader
 //    在 file-local block 上先计算表达式。
+
+table schema + file schema -> TableColumnMapper -> table column mapping + FileScanRequst
+
 class TableColumnMapper {
 public:
     explicit TableColumnMapper(TableColumnMapperOptions options = {}) : _options(std::move(options)) {}
@@ -163,7 +196,7 @@ public:
     Status create_mapping(const std::vector<TableColumn>& table_schema,
                           const std::vector<parquet::ParquetFileColumn>& file_columns,
                           std::vector<ColumnMapping>* mappings) {
-        // 伪逻辑，对齐 DuckDB MultiFileColumnMapper::CreateMapping：
+        // 伪逻辑：根据 table/global schema 和当前文件 schema 创建列映射。
         //
         // for table_column in table_schema:
         //   file_column = find_file_column(table_column, file_columns)
@@ -220,7 +253,7 @@ public:
 
     Status localize_filters(const std::vector<TableFilter>& table_filters,
                             parquet::ParquetScanRequest* parquet_request) const {
-        // 伪逻辑，对齐 DuckDB MultiFileColumnMapper::CreateFilters：
+        // 伪逻辑：根据 ColumnMapping 将 table filter 转换成 file-local filter。
         //
         // 1. trivial mapping:
         //    table col INT, file col INT, WHERE col > 10
@@ -292,7 +325,7 @@ private:
         mapping->is_trivial = is_same_type(table_column.type, file_column->type);
         mapping->finalize_expr = build_finalize_expr(table_column, *file_column);
 
-        // 复杂列递归映射对齐 DuckDB MapColumn：
+        // 复杂列递归映射：
         // - 按 field id/name 在 file_column.children 中查找 table child；
         // - 对未投影 child 可以跳过；
         // - 对缺失 child 生成 default/NULL expression；
@@ -403,13 +436,15 @@ struct TableScanRequest {
 // 1. 绑定 table schema；
 // 2. 调度底层 ParquetReader；
 // 3. 把文件层结果 finalize 成表层结果。
-class TableReader {
+class MultiFileReader {
 public:
     virtual ~TableReader() = default;
 
     virtual Status init(const TFileScanRangeParams& params, const TFileRangeDesc& range,
                         const TableReadOptions& options) = 0;
-    virtual Status init_scan(const TableScanRequest& request) = 0;
+    // 给一个split以及表达式runtime filter，判断是否可以裁剪
+    virtual Status filter(const VExprContextSPtr& expr, bool &can_filter_all) = 0;
+    virtual Status next_reader() = 0;
     virtual Status next_block(Block* table_block, size_t* rows, bool* eof) = 0;
     virtual Status close() = 0;
 };
