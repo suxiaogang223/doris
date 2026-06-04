@@ -33,14 +33,6 @@ RowPositionColumnReader::RowPositionColumnReader(int64_t row_group_first_row)
                   std::make_shared<DataTypeInt64>()),
           _row_group_first_row(row_group_first_row) {}
 
-int RowPositionColumnReader::file_column_id() const {
-    return ParquetColumnReaderFactory::ROW_POSITION_COLUMN_ID;
-}
-
-int RowPositionColumnReader::parquet_leaf_column_id() const {
-    return -1;
-}
-
 const DataTypePtr& RowPositionColumnReader::type() const {
     return _type;
 }

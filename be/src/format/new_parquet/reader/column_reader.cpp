@@ -78,7 +78,7 @@ const reader::FieldProjection* find_child_projection(const reader::FieldProjecti
     }
     auto it = std::find_if(projection->children.begin(), projection->children.end(),
                            [&](const reader::FieldProjection& child_projection) {
-                               return child_projection.field_id == child_schema.field_id;
+                               return child_projection.column_unique_id == child_schema.field_id;
                            });
     return it == projection->children.end() ? nullptr : &*it;
 }
@@ -126,7 +126,7 @@ ParquetColumnReaderFactory::ParquetColumnReaderFactory(
 
 reader::SchemaField ParquetColumnReaderFactory::row_position_schema_field() {
     reader::SchemaField field;
-    field.id = ROW_POSITION_COLUMN_ID;
+    field.column_unique_id = ROW_POSITION_COLUMN_ID;
     field.name = ROW_POSITION_COLUMN_NAME;
     field.type = std::make_shared<DataTypeInt64>();
     field.column_type = reader::ColumnType::ROW_NUMBER;
@@ -411,9 +411,7 @@ Status ParquetColumnReaderFactory::create(const ParquetColumnSchema& column_sche
 }
 
 ParquetColumnReader::ParquetColumnReader(const ParquetColumnSchema& schema, const DataTypePtr type)
-        : _field_id(schema.field_id),
-          _leaf_column_id(schema.leaf_column_id),
-          _nullable_definition_level(schema.nullable_definition_level),
+        : _nullable_definition_level(schema.nullable_definition_level),
           _repeated_repetition_level(schema.repeated_repetition_level),
           _type(std::move(type)),
           _name(schema.name) {}

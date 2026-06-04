@@ -55,13 +55,6 @@ class ParquetColumnReader {
 public:
     virtual ~ParquetColumnReader() = default;
 
-    // file-local column id. Only top-level columns have valid file column ids; nested columns return -1.
-    // For example, for a nested column like `a.b.c`, only `a` has a valid file column id that can be used to access ColumnDescriptor and column chunk metadata; `b` and `c` return -1.
-    virtual int file_column_id() const { return _field_id; }
-
-    // Parquet leaf column id. This is the column id of the leaf column in the Parquet file schema, and can be used to access ColumnDescriptor, RecordReader, column chunk metadata and statistics.
-    // For example, for a map column as `a: map<int, string>`, `a` is the top-level column with `parquet_leaf_column_id` = `file_column_id`. `a.key` is the first child of `a` so `parquet_leaf_column_id` = 0.
-    virtual int parquet_leaf_column_id() const { return _leaf_column_id; }
     int16_t nullable_definition_level() const { return _nullable_definition_level; }
     int16_t repeated_repetition_level() const { return _repeated_repetition_level; }
 
@@ -83,8 +76,6 @@ protected:
     ParquetColumnReader(const ParquetColumnSchema& schema, const DataTypePtr type);
     ParquetColumnReader() = default;
 
-    const int _field_id = -1;
-    const int _leaf_column_id = -1;
     const int16_t _nullable_definition_level = 0;
     const int16_t _repeated_repetition_level = 0;
     const DataTypePtr _type;

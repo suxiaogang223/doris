@@ -286,25 +286,25 @@ Status ParquetScanScheduler::open_next_row_group(
         ParquetColumnReaderFactory column_reader_factory(_current_row_group,
                                                          file_context.schema->num_columns());
         for (const auto& col : request.predicate_columns) {
-            if (col.field_id == ParquetColumnReaderFactory::ROW_POSITION_COLUMN_ID) {
+            if (col.column_unique_id == ParquetColumnReaderFactory::ROW_POSITION_COLUMN_ID) {
                 _current_predicate_columns.push_back(
                         column_reader_factory.create_row_position_column_reader(
                                 _current_row_group_first_row));
                 continue;
             }
-            const auto& column_schema = file_schema[col.field_id];
+            const auto& column_schema = file_schema[col.column_unique_id];
             std::unique_ptr<ParquetColumnReader> column_reader;
             RETURN_IF_ERROR(column_reader_factory.create(*column_schema, &col, &column_reader));
             _current_predicate_columns.push_back(std::move(column_reader));
         }
         for (const auto& col : request.non_predicate_columns) {
-            if (col.field_id == ParquetColumnReaderFactory::ROW_POSITION_COLUMN_ID) {
+            if (col.column_unique_id == ParquetColumnReaderFactory::ROW_POSITION_COLUMN_ID) {
                 _current_non_predicate_columns.push_back(
                         column_reader_factory.create_row_position_column_reader(
                                 _current_row_group_first_row));
                 continue;
             }
-            const auto& column_schema = file_schema[col.field_id];
+            const auto& column_schema = file_schema[col.column_unique_id];
             std::unique_ptr<ParquetColumnReader> column_reader;
             RETURN_IF_ERROR(column_reader_factory.create(*column_schema, &col, &column_reader));
             _current_non_predicate_columns.push_back(std::move(column_reader));
@@ -338,9 +338,9 @@ Status ParquetScanScheduler::read_filter_columns(int64_t batch_rows,
         selection->resize(static_cast<size_t>(batch_rows));
     }
     for (size_t filter_idx = 0; filter_idx < request.predicate_columns.size(); ++filter_idx) {
-        const auto& file_field_id = request.predicate_columns[filter_idx].field_id;
+        const auto& file_column_id = request.predicate_columns[filter_idx].column_unique_id;
         auto& column_reader = _current_predicate_columns[filter_idx];
-        auto position_it = request.column_positions.find(file_field_id);
+        auto position_it = request.column_positions.find(file_column_id);
         DORIS_CHECK(position_it != request.column_positions.end());
         const auto block_position = position_it->second;
         auto column = file_block->get_by_position(block_position).column->assert_mutable();
@@ -374,7 +374,7 @@ Status ParquetScanScheduler::read_current_row_group_batch(int64_t batch_rows,
     if (need_filter_output) {
         IColumn::Filter output_filter = selection_to_filter(selection, selected_rows, batch_rows);
         for (const auto& col : request.predicate_columns) {
-            auto position_it = request.column_positions.find(col.field_id);
+            auto position_it = request.column_positions.find(col.column_unique_id);
             DORIS_CHECK(position_it != request.column_positions.end());
             const auto block_position = position_it->second;
             RETURN_IF_CATCH_EXCEPTION(file_block->replace_by_position(
@@ -385,8 +385,8 @@ Status ParquetScanScheduler::read_current_row_group_batch(int64_t batch_rows,
 
     for (size_t output_idx = 0; output_idx < _current_non_predicate_columns.size(); ++output_idx) {
         auto& column_reader = _current_non_predicate_columns[output_idx];
-        auto position_it =
-                request.column_positions.find(request.non_predicate_columns[output_idx].field_id);
+        auto position_it = request.column_positions.find(
+                request.non_predicate_columns[output_idx].column_unique_id);
         DORIS_CHECK(position_it != request.column_positions.end());
         const auto block_position = position_it->second;
         auto column_guard = file_block->mutate_column_scoped(block_position);

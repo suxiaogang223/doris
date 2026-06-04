@@ -102,12 +102,12 @@ reader::TableColumn* find_or_add_child(reader::TableColumn* parent, reader::Colu
                                        std::string name, DataTypePtr type) {
     DORIS_CHECK(parent != nullptr);
     for (auto& child : parent->children) {
-        if (child.id == id || child.name == name) {
+        if (child.column_unique_id == id || child.name == name) {
             return &child;
         }
     }
     parent->children.push_back({
-            .id = id,
+            .column_unique_id = id,
             .name = std::move(name),
             .type = std::move(type),
             .children = {},
@@ -137,7 +137,7 @@ DataTypePtr find_struct_child_type_by_name(const DataTypeStruct& struct_type,
 reader::TableColumn build_schema_column_from_external_field(const schema::external::TField& field,
                                                             DataTypePtr type) {
     reader::TableColumn column {
-            .id = field.__isset.id ? field.id : -1,
+            .column_unique_id = field.__isset.id ? field.id : -1,
             .name = field.__isset.name ? field.name : "",
             .type = std::move(type),
             .children = {},
@@ -217,8 +217,9 @@ const reader::TableColumn* find_schema_child_by_path(const reader::TableColumn* 
     int32_t parsed_field_id = -1;
     if (parse_non_negative_int(child_path, &parsed_field_id)) {
         const auto child_it = std::ranges::find_if(
-                schema_column->children,
-                [&](const reader::TableColumn& child) { return child.id == parsed_field_id; });
+                schema_column->children, [&](const reader::TableColumn& child) {
+                    return child.column_unique_id == parsed_field_id;
+                });
         return child_it == schema_column->children.end() ? nullptr : &*child_it;
     }
     const auto child_it = std::ranges::find_if(schema_column->children, [&](const auto& child) {
@@ -251,7 +252,7 @@ const schema::external::TField* find_external_root_field(const TFileScanRangePar
         if (field == nullptr) {
             continue;
         }
-        if (field->__isset.id && field->id == column.id) {
+        if (field->__isset.id && field->id == column.column_unique_id) {
             return field;
         }
         if (field->__isset.name && to_lower(field->name) == to_lower(column.name)) {
@@ -314,7 +315,7 @@ Status build_struct_children_from_access_node(reader::TableColumn* column,
 
         // Try to find the child field in the schema column first. If not found, fallback to find the child field in the struct type by name (case-insensitive).
         const auto* schema_child = find_schema_child_by_path(schema_column, child_path);
-        int32_t field_id = schema_child == nullptr ? -1 : schema_child->id;
+        int32_t field_id = schema_child == nullptr ? -1 : schema_child->column_unique_id;
         std::string field_name = schema_child == nullptr ? child_path : schema_child->name;
         DataTypePtr field_type = schema_child == nullptr ? nullptr : schema_child->type;
         if (schema_child == nullptr) {
@@ -487,7 +488,8 @@ Status build_nested_children_from_access_paths(reader::TableColumn* column,
         }
         int32_t top_level_id = -1;
         if (to_lower(path.front()) != to_lower(column->name) &&
-            (!parse_non_negative_int(path.front(), &top_level_id) || top_level_id != column->id)) {
+            (!parse_non_negative_int(path.front(), &top_level_id) ||
+             top_level_id != column->column_unique_id)) {
             return Status::NotSupported("FileScannerV2 access path {} does not match slot {}",
                                         access_path_to_string(path), column->name);
         }
@@ -780,7 +782,7 @@ Status FileScannerV2::_build_default_expr(const TFileScanSlotInfo& slot_info,
 reader::TableColumn FileScannerV2::_build_table_column(const SlotDescriptor* slot_desc) {
     DORIS_CHECK(slot_desc != nullptr);
     reader::TableColumn column;
-    column.id = slot_desc->col_unique_id();
+    column.column_unique_id = slot_desc->col_unique_id();
     column.name = slot_desc->col_name();
     column.type = slot_desc->get_data_type_ptr();
     return column;
@@ -797,7 +799,7 @@ Status FileScannerV2::_build_table_column_predicates(
             continue;
         }
         (*predicates)[it->second->col_unique_id()] = {
-                reader::TableColumn {.id = it->second->col_unique_id(),
+                reader::TableColumn {.column_unique_id = it->second->col_unique_id(),
                                      .name = it->second->col_name(),
                                      .type = it->second->get_data_type_ptr()},
                 slot_predicate_list};

@@ -28,8 +28,6 @@ class RowPositionColumnReader final : public ParquetColumnReader {
 public:
     explicit RowPositionColumnReader(int64_t row_group_first_row);
 
-    int file_column_id() const override;
-    int parquet_leaf_column_id() const override;
     const DataTypePtr& type() const override;
     const std::string& name() const override;
 

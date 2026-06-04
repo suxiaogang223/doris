@@ -65,7 +65,7 @@ namespace {
 constexpr int64_t ROW_COUNT = 5;
 
 reader::FieldProjection field_projection(reader::ColumnId column_id) {
-    return reader::FieldProjection {.field_id = column_id};
+    return reader::FieldProjection {.column_unique_id = column_id};
 }
 
 std::vector<reader::ColumnId> projection_ids(
@@ -73,7 +73,7 @@ std::vector<reader::ColumnId> projection_ids(
     std::vector<reader::ColumnId> ids;
     ids.reserve(projections.size());
     for (const auto& projection : projections) {
-        ids.push_back(projection.field_id);
+        ids.push_back(projection.column_unique_id);
     }
     return ids;
 }
@@ -567,7 +567,7 @@ public:
     Status get_schema(std::vector<reader::SchemaField>* file_schema) const override {
         file_schema->clear();
         reader::SchemaField field;
-        field.id = 0;
+        field.column_unique_id = 0;
         field.name = "id";
         field.type = std::make_shared<DataTypeInt32>();
         file_schema->push_back(std::move(field));
@@ -622,14 +622,14 @@ TEST(FileReaderTest, CloseReleasesSharedIOContext) {
 
 TEST(TableColumnMapperTest, CreatesComplexProjectionForStructChildren) {
     reader::SchemaField struct_field;
-    struct_field.id = 0;
+    struct_field.column_unique_id = 0;
     struct_field.name = "s";
     reader::SchemaField a_field;
-    a_field.id = 0;
+    a_field.column_unique_id = 0;
     a_field.name = "a";
     a_field.type = std::make_shared<DataTypeInt32>();
     reader::SchemaField b_field;
-    b_field.id = 1;
+    b_field.column_unique_id = 1;
     b_field.name = "b";
     b_field.type = std::make_shared<DataTypeString>();
     struct_field.children = {a_field, b_field};
@@ -637,11 +637,11 @@ TEST(TableColumnMapperTest, CreatesComplexProjectionForStructChildren) {
                                                          Strings {"a", "b"});
 
     reader::TableColumn table_child;
-    table_child.id = 101;
+    table_child.column_unique_id = 101;
     table_child.name = "b";
     table_child.type = b_field.type;
     reader::TableColumn table_column;
-    table_column.id = 100;
+    table_column.column_unique_id = 100;
     table_column.name = "s";
     table_column.type = std::make_shared<DataTypeStruct>(DataTypes {b_field.type}, Strings {"b"});
     table_column.children = {table_child};
@@ -656,10 +656,10 @@ TEST(TableColumnMapperTest, CreatesComplexProjectionForStructChildren) {
     EXPECT_EQ(projection_ids(request->non_predicate_columns), std::vector<reader::ColumnId>({0}));
     ASSERT_EQ(request->non_predicate_columns.size(), 1);
     const auto& projection = request->non_predicate_columns[0];
-    EXPECT_EQ(projection.field_id, 0);
+    EXPECT_EQ(projection.column_unique_id, 0);
     ASSERT_FALSE(projection.project_all_children);
     ASSERT_EQ(projection.children.size(), 1);
-    EXPECT_EQ(projection.children[0].field_id, 1);
+    EXPECT_EQ(projection.children[0].column_unique_id, 1);
 
     ASSERT_EQ(mapper.mappings().size(), 1);
     const auto* projected_type =
@@ -672,26 +672,26 @@ TEST(TableColumnMapperTest, MergesStructFilterOnlyChildIntoPredicateProjection) 
     auto a_type = std::make_shared<DataTypeInt32>();
     auto b_type = std::make_shared<DataTypeString>();
     reader::SchemaField a_field;
-    a_field.id = 0;
+    a_field.column_unique_id = 0;
     a_field.name = "a";
     a_field.type = a_type;
     reader::SchemaField b_field;
-    b_field.id = 1;
+    b_field.column_unique_id = 1;
     b_field.name = "b";
     b_field.type = b_type;
     reader::SchemaField struct_field;
-    struct_field.id = 0;
+    struct_field.column_unique_id = 0;
     struct_field.name = "s";
     struct_field.type =
             std::make_shared<DataTypeStruct>(DataTypes {a_type, b_type}, Strings {"a", "b"});
     struct_field.children = {a_field, b_field};
 
     reader::TableColumn table_child;
-    table_child.id = 101;
+    table_child.column_unique_id = 101;
     table_child.name = "b";
     table_child.type = b_type;
     reader::TableColumn table_column;
-    table_column.id = 100;
+    table_column.column_unique_id = 100;
     table_column.name = "s";
     table_column.type = std::make_shared<DataTypeStruct>(DataTypes {b_type}, Strings {"b"});
     table_column.children = {table_child};
@@ -719,11 +719,11 @@ TEST(TableColumnMapperTest, MergesStructFilterOnlyChildIntoPredicateProjection) 
     EXPECT_TRUE(request.non_predicate_columns.empty());
     ASSERT_EQ(request.predicate_columns.size(), 1);
     const auto& projection = request.predicate_columns[0];
-    EXPECT_EQ(projection.field_id, 0);
+    EXPECT_EQ(projection.column_unique_id, 0);
     ASSERT_FALSE(projection.project_all_children);
     ASSERT_EQ(projection.children.size(), 2);
-    EXPECT_EQ(projection.children[0].field_id, 1);
-    EXPECT_EQ(projection.children[1].field_id, 0);
+    EXPECT_EQ(projection.children[0].column_unique_id, 1);
+    EXPECT_EQ(projection.children[1].column_unique_id, 0);
     ASSERT_EQ(request.column_predicate_filters.size(), 1);
     EXPECT_EQ(request.column_predicate_filters[0].file_column_id, 0);
     EXPECT_EQ(request.column_predicate_filters[0].file_child_id_path, std::vector<int32_t>({0}));
@@ -743,21 +743,21 @@ TEST(TableColumnMapperTest, MergesStructFilterOnlyChildIntoPredicateProjection) 
 TEST(TableColumnMapperTest, MapsRenamedNestedStructPredicateByFieldId) {
     auto id_type = std::make_shared<DataTypeInt32>();
     reader::SchemaField file_child;
-    file_child.id = 101;
+    file_child.column_unique_id = 101;
     file_child.name = "file_id";
     file_child.type = id_type;
     reader::SchemaField struct_field;
-    struct_field.id = 100;
+    struct_field.column_unique_id = 100;
     struct_field.name = "s";
     struct_field.type = std::make_shared<DataTypeStruct>(DataTypes {id_type}, Strings {"file_id"});
     struct_field.children = {file_child};
 
     reader::TableColumn table_child;
-    table_child.id = 101;
+    table_child.column_unique_id = 101;
     table_child.name = "table_id";
     table_child.type = id_type;
     reader::TableColumn table_column;
-    table_column.id = 100;
+    table_column.column_unique_id = 100;
     table_column.name = "s";
     table_column.type = std::make_shared<DataTypeStruct>(DataTypes {id_type}, Strings {"table_id"});
     table_column.children = {table_child};
@@ -783,10 +783,10 @@ TEST(TableColumnMapperTest, MapsRenamedNestedStructPredicateByFieldId) {
 
     ASSERT_EQ(request.predicate_columns.size(), 1);
     const auto& projection = request.predicate_columns[0];
-    EXPECT_EQ(projection.field_id, 100);
+    EXPECT_EQ(projection.column_unique_id, 100);
     ASSERT_FALSE(projection.project_all_children);
     ASSERT_EQ(projection.children.size(), 1);
-    EXPECT_EQ(projection.children[0].field_id, 101);
+    EXPECT_EQ(projection.children[0].column_unique_id, 101);
 
     ASSERT_EQ(request.column_predicate_filters.size(), 1);
     EXPECT_EQ(request.column_predicate_filters[0].file_column_id, 100);
@@ -799,26 +799,26 @@ TEST(TableColumnMapperTest, BuildsNestedStructInListPredicateFilter) {
     auto a_type = std::make_shared<DataTypeInt32>();
     auto b_type = std::make_shared<DataTypeString>();
     reader::SchemaField a_field;
-    a_field.id = 0;
+    a_field.column_unique_id = 0;
     a_field.name = "a";
     a_field.type = a_type;
     reader::SchemaField b_field;
-    b_field.id = 1;
+    b_field.column_unique_id = 1;
     b_field.name = "b";
     b_field.type = b_type;
     reader::SchemaField struct_field;
-    struct_field.id = 0;
+    struct_field.column_unique_id = 0;
     struct_field.name = "s";
     struct_field.type =
             std::make_shared<DataTypeStruct>(DataTypes {a_type, b_type}, Strings {"a", "b"});
     struct_field.children = {a_field, b_field};
 
     reader::TableColumn table_child;
-    table_child.id = 101;
+    table_child.column_unique_id = 101;
     table_child.name = "b";
     table_child.type = b_type;
     reader::TableColumn table_column;
-    table_column.id = 100;
+    table_column.column_unique_id = 100;
     table_column.name = "s";
     table_column.type = std::make_shared<DataTypeStruct>(DataTypes {b_type}, Strings {"b"});
     table_column.children = {table_child};
@@ -854,26 +854,26 @@ TEST(TableColumnMapperTest, BuildsNestedStructPredicateFilterForReverseCompariso
     auto a_type = std::make_shared<DataTypeInt32>();
     auto b_type = std::make_shared<DataTypeString>();
     reader::SchemaField a_field;
-    a_field.id = 0;
+    a_field.column_unique_id = 0;
     a_field.name = "a";
     a_field.type = a_type;
     reader::SchemaField b_field;
-    b_field.id = 1;
+    b_field.column_unique_id = 1;
     b_field.name = "b";
     b_field.type = b_type;
     reader::SchemaField struct_field;
-    struct_field.id = 0;
+    struct_field.column_unique_id = 0;
     struct_field.name = "s";
     struct_field.type =
             std::make_shared<DataTypeStruct>(DataTypes {a_type, b_type}, Strings {"a", "b"});
     struct_field.children = {a_field, b_field};
 
     reader::TableColumn table_child;
-    table_child.id = 101;
+    table_child.column_unique_id = 101;
     table_child.name = "b";
     table_child.type = b_type;
     reader::TableColumn table_column;
-    table_column.id = 100;
+    table_column.column_unique_id = 100;
     table_column.name = "s";
     table_column.type = std::make_shared<DataTypeStruct>(DataTypes {b_type}, Strings {"b"});
     table_column.children = {table_child};
@@ -915,34 +915,34 @@ TEST(TableColumnMapperTest, BuildsNestedStructInListPredicateFilterForDeepPath) 
             std::make_shared<DataTypeStruct>(DataTypes {inner_type, b_type}, Strings {"a", "b"});
 
     reader::SchemaField id_field;
-    id_field.id = 0;
+    id_field.column_unique_id = 0;
     id_field.name = "id";
     id_field.type = id_type;
     reader::SchemaField name_field;
-    name_field.id = 1;
+    name_field.column_unique_id = 1;
     name_field.name = "n";
     name_field.type = name_type;
     reader::SchemaField a_field;
-    a_field.id = 0;
+    a_field.column_unique_id = 0;
     a_field.name = "a";
     a_field.type = inner_type;
     a_field.children = {id_field, name_field};
     reader::SchemaField b_field;
-    b_field.id = 1;
+    b_field.column_unique_id = 1;
     b_field.name = "b";
     b_field.type = b_type;
     reader::SchemaField struct_field;
-    struct_field.id = 0;
+    struct_field.column_unique_id = 0;
     struct_field.name = "s";
     struct_field.type = full_struct_type;
     struct_field.children = {a_field, b_field};
 
     reader::TableColumn table_child;
-    table_child.id = 101;
+    table_child.column_unique_id = 101;
     table_child.name = "b";
     table_child.type = b_type;
     reader::TableColumn table_column;
-    table_column.id = 100;
+    table_column.column_unique_id = 100;
     table_column.name = "s";
     table_column.type = std::make_shared<DataTypeStruct>(DataTypes {b_type}, Strings {"b"});
     table_column.children = {table_child};
@@ -978,26 +978,26 @@ TEST(TableColumnMapperTest, DoesNotBuildNestedPredicateFilterForMissingChild) {
     auto a_type = std::make_shared<DataTypeInt32>();
     auto b_type = std::make_shared<DataTypeString>();
     reader::SchemaField a_field;
-    a_field.id = 0;
+    a_field.column_unique_id = 0;
     a_field.name = "a";
     a_field.type = a_type;
     reader::SchemaField b_field;
-    b_field.id = 1;
+    b_field.column_unique_id = 1;
     b_field.name = "b";
     b_field.type = b_type;
     reader::SchemaField struct_field;
-    struct_field.id = 0;
+    struct_field.column_unique_id = 0;
     struct_field.name = "s";
     struct_field.type =
             std::make_shared<DataTypeStruct>(DataTypes {a_type, b_type}, Strings {"a", "b"});
     struct_field.children = {a_field, b_field};
 
     reader::TableColumn table_child;
-    table_child.id = 101;
+    table_child.column_unique_id = 101;
     table_child.name = "b";
     table_child.type = b_type;
     reader::TableColumn table_column;
-    table_column.id = 100;
+    table_column.column_unique_id = 100;
     table_column.name = "s";
     table_column.type = std::make_shared<DataTypeStruct>(DataTypes {b_type}, Strings {"b"});
     table_column.children = {table_child};
@@ -1030,26 +1030,26 @@ TEST(TableColumnMapperTest, DoesNotBuildNestedPredicateFilterFromOr) {
     auto a_type = std::make_shared<DataTypeInt32>();
     auto b_type = std::make_shared<DataTypeString>();
     reader::SchemaField a_field;
-    a_field.id = 0;
+    a_field.column_unique_id = 0;
     a_field.name = "a";
     a_field.type = a_type;
     reader::SchemaField b_field;
-    b_field.id = 1;
+    b_field.column_unique_id = 1;
     b_field.name = "b";
     b_field.type = b_type;
     reader::SchemaField struct_field;
-    struct_field.id = 0;
+    struct_field.column_unique_id = 0;
     struct_field.name = "s";
     struct_field.type =
             std::make_shared<DataTypeStruct>(DataTypes {a_type, b_type}, Strings {"a", "b"});
     struct_field.children = {a_field, b_field};
 
     reader::TableColumn table_child;
-    table_child.id = 101;
+    table_child.column_unique_id = 101;
     table_child.name = "b";
     table_child.type = b_type;
     reader::TableColumn table_column;
-    table_column.id = 100;
+    table_column.column_unique_id = 100;
     table_column.name = "s";
     table_column.type = std::make_shared<DataTypeStruct>(DataTypes {b_type}, Strings {"b"});
     table_column.children = {table_child};
@@ -1095,51 +1095,51 @@ TEST(TableColumnMapperTest, CreatesComplexProjectionForMapValueStructChildren) {
             std::make_shared<DataTypeStruct>(DataTypes {a_type, b_type}, Strings {"a", "b"});
 
     reader::SchemaField key_field;
-    key_field.id = 0;
+    key_field.column_unique_id = 0;
     key_field.name = "key";
     key_field.type = key_type;
     reader::SchemaField a_field;
-    a_field.id = 0;
+    a_field.column_unique_id = 0;
     a_field.name = "a";
     a_field.type = a_type;
     reader::SchemaField b_field;
-    b_field.id = 1;
+    b_field.column_unique_id = 1;
     b_field.name = "b";
     b_field.type = b_type;
     reader::SchemaField value_field;
-    value_field.id = 1;
+    value_field.column_unique_id = 1;
     value_field.name = "value";
     value_field.type = value_type;
     value_field.children = {a_field, b_field};
     reader::SchemaField entry_field;
-    entry_field.id = 0;
+    entry_field.column_unique_id = 0;
     entry_field.name = "entries";
     entry_field.type = std::make_shared<DataTypeStruct>(DataTypes {key_type, value_type},
                                                         Strings {"key", "value"});
     entry_field.children = {key_field, value_field};
     reader::SchemaField map_field;
-    map_field.id = 0;
+    map_field.column_unique_id = 0;
     map_field.name = "m";
     map_field.type = std::make_shared<DataTypeMap>(key_type, value_type);
     map_field.children = {entry_field};
 
     reader::TableColumn table_value_child;
-    table_value_child.id = 103;
+    table_value_child.column_unique_id = 103;
     table_value_child.name = "b";
     table_value_child.type = b_type;
     reader::TableColumn table_value;
-    table_value.id = 102;
+    table_value.column_unique_id = 102;
     table_value.name = "value";
     table_value.type = std::make_shared<DataTypeStruct>(DataTypes {b_type}, Strings {"b"});
     table_value.children = {table_value_child};
     reader::TableColumn table_entry;
-    table_entry.id = 101;
+    table_entry.column_unique_id = 101;
     table_entry.name = "entries";
     table_entry.type =
             std::make_shared<DataTypeStruct>(DataTypes {table_value.type}, Strings {"value"});
     table_entry.children = {table_value};
     reader::TableColumn table_column;
-    table_column.id = 100;
+    table_column.column_unique_id = 100;
     table_column.name = "m";
     table_column.type = std::make_shared<DataTypeMap>(key_type, table_value.type);
     table_column.children = {table_entry};
@@ -1154,14 +1154,14 @@ TEST(TableColumnMapperTest, CreatesComplexProjectionForMapValueStructChildren) {
     EXPECT_EQ(projection_ids(request->non_predicate_columns), std::vector<reader::ColumnId>({0}));
     ASSERT_EQ(request->non_predicate_columns.size(), 1);
     const auto& projection = request->non_predicate_columns[0];
-    EXPECT_EQ(projection.field_id, 0);
+    EXPECT_EQ(projection.column_unique_id, 0);
     ASSERT_FALSE(projection.project_all_children);
     ASSERT_EQ(projection.children.size(), 1);
-    EXPECT_EQ(projection.children[0].field_id, 0);
+    EXPECT_EQ(projection.children[0].column_unique_id, 0);
     ASSERT_EQ(projection.children[0].children.size(), 1);
-    EXPECT_EQ(projection.children[0].children[0].field_id, 1);
+    EXPECT_EQ(projection.children[0].children[0].column_unique_id, 1);
     ASSERT_EQ(projection.children[0].children[0].children.size(), 1);
-    EXPECT_EQ(projection.children[0].children[0].children[0].field_id, 1);
+    EXPECT_EQ(projection.children[0].children[0].children[0].column_unique_id, 1);
 
     ASSERT_EQ(mapper.mappings().size(), 1);
     const auto* projected_type =
@@ -1175,22 +1175,22 @@ TEST(TableColumnMapperTest, CreatesComplexProjectionForMapValueStructChildren) {
 
 TEST(TableColumnMapperTest, ColumnPredicatesDoNotForcePredicateMaterialization) {
     reader::SchemaField id_field;
-    id_field.id = 0;
+    id_field.column_unique_id = 0;
     id_field.name = "id";
     id_field.type = std::make_shared<DataTypeInt32>();
 
     reader::SchemaField value_field;
-    value_field.id = 1;
+    value_field.column_unique_id = 1;
     value_field.name = "value";
     value_field.type = std::make_shared<DataTypeString>();
 
     reader::TableColumn table_id;
-    table_id.id = 0;
+    table_id.column_unique_id = 0;
     table_id.name = "id";
     table_id.type = id_field.type;
 
     reader::TableColumn table_value;
-    table_value.id = 1;
+    table_value.column_unique_id = 1;
     table_value.name = "value";
     table_value.type = value_field.type;
 
@@ -1344,10 +1344,10 @@ TEST_F(NewParquetReaderTest, GetSchemaReturnsFileLocalColumns) {
     std::vector<reader::SchemaField> schema;
     ASSERT_TRUE(reader->get_schema(&schema).ok());
     ASSERT_EQ(schema.size(), 2);
-    EXPECT_EQ(schema[0].id, 0);
+    EXPECT_EQ(schema[0].column_unique_id, 0);
     EXPECT_EQ(schema[0].name, "id");
     EXPECT_EQ(schema[0].type->get_primitive_type(), TYPE_INT);
-    EXPECT_EQ(schema[1].id, 1);
+    EXPECT_EQ(schema[1].column_unique_id, 1);
     EXPECT_EQ(schema[1].name, "value");
     EXPECT_EQ(schema[1].type->get_primitive_type(), TYPE_STRING);
 }

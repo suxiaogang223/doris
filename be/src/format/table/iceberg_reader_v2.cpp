@@ -281,16 +281,18 @@ Status IcebergTableReader::_append_equality_delete_predicates(reader::FileScanRe
         DCHECK_EQ(filter.field_ids.size(), filter.key_types.size());
         for (size_t idx = 0; idx < filter.field_ids.size(); ++idx) {
             const int field_id = filter.field_ids[idx];
-            auto field_it = std::ranges::find_if(
-                    _data_reader.file_schema,
-                    [field_id](const reader::SchemaField& field) { return field.id == field_id; });
+            auto field_it = std::ranges::find_if(_data_reader.file_schema,
+                                                 [field_id](const reader::SchemaField& field) {
+                                                     return field.column_unique_id == field_id;
+                                                 });
             if (field_it == _data_reader.file_schema.end()) {
                 return Status::InternalError(
                         "Can not find equality delete column field id {} in data file schema",
                         field_id);
             }
-            _append_file_scan_column(request, field_it->id, &request->predicate_columns);
-            const auto block_position = request->column_positions.at(field_it->id);
+            _append_file_scan_column(request, field_it->column_unique_id,
+                                     &request->predicate_columns);
+            const auto block_position = request->column_positions.at(field_it->column_unique_id);
             auto slot = TableSlotRef::create_shared(cast_set<int>(block_position),
                                                     cast_set<int>(block_position), -1,
                                                     field_it->type, field_it->name);
@@ -349,11 +351,12 @@ Status IcebergTableReader::_read_parquet_position_delete_file(
     }
 
     auto request = std::make_unique<reader::FileScanRequest>();
-    request->non_predicate_columns = {reader::FieldProjection {.field_id = file_path_field->id},
-                                      reader::FieldProjection {.field_id = pos_field->id}};
+    request->non_predicate_columns = {
+            reader::FieldProjection {.column_unique_id = file_path_field->column_unique_id},
+            reader::FieldProjection {.column_unique_id = pos_field->column_unique_id}};
     request->column_positions = {
-            {file_path_field->id, ICEBERG_FILE_PATH_BLOCK_POSITION},
-            {pos_field->id, ICEBERG_ROW_POS_BLOCK_POSITION},
+            {file_path_field->column_unique_id, ICEBERG_FILE_PATH_BLOCK_POSITION},
+            {pos_field->column_unique_id, ICEBERG_ROW_POS_BLOCK_POSITION},
     };
     RETURN_IF_ERROR(reader.open(request));
 
@@ -445,9 +448,10 @@ Status IcebergTableReader::_read_parquet_equality_delete_file(
     std::vector<int> delete_field_ids;
     std::vector<DataTypePtr> delete_key_types;
     for (const auto field_id : delete_file.field_ids) {
-        auto field_it = std::find_if(
-                schema.begin(), schema.end(),
-                [field_id](const reader::SchemaField& field) { return field_id == field.id; });
+        auto field_it = std::find_if(schema.begin(), schema.end(),
+                                     [field_id](const reader::SchemaField& field) {
+                                         return field_id == field.column_unique_id;
+                                     });
         if (field_it == schema.end()) {
             return Status::InternalError("Can not find field id {} in equality delete file {}",
                                          field_id, delete_file.path);
@@ -463,8 +467,9 @@ Status IcebergTableReader::_read_parquet_equality_delete_file(
 
     auto request = std::make_unique<reader::FileScanRequest>();
     for (size_t idx = 0; idx < delete_fields.size(); ++idx) {
-        request->non_predicate_columns.push_back({.field_id = delete_fields[idx].id});
-        request->column_positions.emplace(delete_fields[idx].id, idx);
+        request->non_predicate_columns.push_back(
+                {.column_unique_id = delete_fields[idx].column_unique_id});
+        request->column_positions.emplace(delete_fields[idx].column_unique_id, idx);
     }
     RETURN_IF_ERROR(reader.open(request));
 

@@ -56,17 +56,20 @@ enum ColumnType {
 // schema 语义。Iceberg field id、name mapping、default/generated/partition 列都不在
 // FileReader 内部解释。
 struct SchemaField {
-    // Column ID for top-level fields. For nested fields, column_id is the index of children.
-    int32_t id = -1;
+    // File-local column id for top-level fields. For nested fields, column_unique_id is the id
+    // that uniquely identifies a child under its parent, usually the child index for formats
+    // without stable nested field ids.
+    int32_t column_unique_id = -1;
     std::string name;
     DataTypePtr type;
     std::vector<SchemaField> children;
     ColumnType column_type = ColumnType::DATA_COLUMN;
 };
 
-// Projection for both scalar type and nested type. `field_id` denotes file_column_id for top-level columns, and child id for nested columns.
+// Projection for both scalar type and nested type. `column_unique_id` is file-local and matches
+// SchemaField::column_unique_id at the same schema level.
 struct FieldProjection {
-    ColumnId field_id = -1;
+    ColumnId column_unique_id = -1;
     bool project_all_children = true;
     std::vector<FieldProjection> children {};
 };

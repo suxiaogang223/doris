@@ -67,7 +67,7 @@ using DeleteRows = std::vector<int64_t>;
 // table/global schema 中的列视图。
 // Iceberg 场景下，id 默认对应 Iceberg field id。该结构不描述文件中的物理列。
 struct TableColumn {
-    ColumnId id = -1; // column_unique_id
+    ColumnId column_unique_id = -1;
     std::string name;
     DataTypePtr type;
     std::vector<TableColumn> children {};
@@ -276,19 +276,21 @@ protected:
 
             SchemaField projected_field;
             {
-                auto it = std::find_if(
-                        file_request->non_predicate_columns.begin(),
-                        file_request->non_predicate_columns.end(),
-                        [&](const FieldProjection& p) { return p.field_id == file_column_id; });
+                auto it = std::find_if(file_request->non_predicate_columns.begin(),
+                                       file_request->non_predicate_columns.end(),
+                                       [&](const FieldProjection& p) {
+                                           return p.column_unique_id == file_column_id;
+                                       });
                 if (it != file_request->non_predicate_columns.end()) {
                     RETURN_IF_ERROR(_project_schema_field(*field, *it, &projected_field));
                 }
             }
             {
-                auto it = std::find_if(
-                        file_request->predicate_columns.begin(),
-                        file_request->predicate_columns.end(),
-                        [&](const FieldProjection& p) { return p.field_id == file_column_id; });
+                auto it = std::find_if(file_request->predicate_columns.begin(),
+                                       file_request->predicate_columns.end(),
+                                       [&](const FieldProjection& p) {
+                                           return p.column_unique_id == file_column_id;
+                                       });
                 if (it != file_request->predicate_columns.end()) {
                     RETURN_IF_ERROR(_project_schema_field(*field, *it, &projected_field));
                 }
@@ -334,24 +336,25 @@ protected:
         DORIS_CHECK(scan_columns != nullptr);
         if (scan_columns == &request->non_predicate_columns &&
             std::ranges::find_if(request->predicate_columns, [&](const FieldProjection& p) {
-                return p.field_id == column_id;
+                return p.column_unique_id == column_id;
             }) != request->predicate_columns.end()) {
             // The column is already added as a predicate column, no need to add it again as a non-predicate column because predicate columns are also returned in the file reader block and can be used for materialization and filtering.
             return;
         }
         if (!request->column_positions.contains(column_id)) {
             request->column_positions.emplace(column_id, _next_block_position(*request));
-            scan_columns->push_back({.field_id = column_id});
+            scan_columns->push_back({.column_unique_id = column_id});
         } else if (std::ranges::find_if(*scan_columns, [&](const FieldProjection& p) {
-                       return p.field_id == column_id;
+                       return p.column_unique_id == column_id;
                    }) == scan_columns->end()) {
-            scan_columns->push_back({.field_id = column_id});
+            scan_columns->push_back({.column_unique_id = column_id});
         }
         if (scan_columns == &request->predicate_columns) {
             request->non_predicate_columns.erase(
-                    std::ranges::find_if(
-                            request->non_predicate_columns,
-                            [&](const FieldProjection& p) { return p.field_id == column_id; }),
+                    std::ranges::find_if(request->non_predicate_columns,
+                                         [&](const FieldProjection& p) {
+                                             return p.column_unique_id == column_id;
+                                         }),
                     request->non_predicate_columns.end());
         }
         if (column_id == doris::parquet::ParquetColumnReaderFactory::ROW_POSITION_COLUMN_ID &&
@@ -460,7 +463,7 @@ protected:
         // must be enough for the upper MIN/MAX aggregate without evaluating default expressions or
         // virtual columns.
         for (const auto& mapping : _data_reader.column_mapper.mappings()) {
-            if (!mapping.field_id.has_value() ||
+            if (!mapping.file_column_unique_id.has_value() ||
                 mapping.virtual_column_type != TableVirtualColumnType::INVALID ||
                 mapping.default_expr != nullptr || mapping.file_type == nullptr ||
                 mapping.table_type == nullptr) {
@@ -475,7 +478,7 @@ protected:
 
     Status _materialize_mapping_column(const ColumnMapping& mapping, Block* current_block,
                                        const size_t rows, ColumnPtr* column) {
-        if (mapping.has_complex_projection && mapping.field_id.has_value() &&
+        if (mapping.has_complex_projection && mapping.file_column_unique_id.has_value() &&
             !mapping.child_mappings.empty()) {
             int res_id;
             RETURN_IF_ERROR(mapping.projection->execute(current_block, &res_id));
@@ -561,7 +564,7 @@ protected:
         child_columns.reserve(mapping.child_mappings.size());
         size_t file_child_idx = 0;
         for (const auto& child_mapping : mapping.child_mappings) {
-            if (!child_mapping.field_id.has_value()) {
+            if (!child_mapping.file_column_unique_id.has_value()) {
                 child_columns.push_back(
                         child_mapping.table_type->create_column_const_with_default_value(rows)
                                 ->convert_to_full_column_if_const());
@@ -696,9 +699,9 @@ protected:
         }
         request->columns.reserve(_data_reader.column_mapper.mappings().size());
         for (const auto& mapping : _data_reader.column_mapper.mappings()) {
-            DORIS_CHECK(mapping.field_id.has_value());
+            DORIS_CHECK(mapping.file_column_unique_id.has_value());
             FileAggregateRequest::Column column;
-            column.projection.field_id = *mapping.field_id;
+            column.projection.column_unique_id = *mapping.file_column_unique_id;
             if (!mapping.child_mappings.empty()) {
                 RETURN_IF_ERROR(build_aggregate_projection(mapping, &column.projection));
             }
@@ -741,7 +744,7 @@ protected:
             for (size_t block_position = 0; block_position < _data_reader.file_block_layout.size();
                  ++block_position) {
                 if (_data_reader.file_block_layout[block_position].file_column_id ==
-                    file_result.columns[column_idx].projection.field_id) {
+                    file_result.columns[column_idx].projection.column_unique_id) {
                     found_file_column = true;
                     auto column = file_block.get_by_position(block_position)
                                           .type->create_column()
@@ -811,7 +814,7 @@ private:
     static const SchemaField* _find_schema_field(const std::vector<SchemaField>& schema,
                                                  ColumnId column_id) {
         for (const auto& field : schema) {
-            if (field.id == column_id) {
+            if (field.column_unique_id == column_id) {
                 return &field;
             }
         }
@@ -829,7 +832,7 @@ private:
         size_t mapped_children = 0;
         const ColumnMapping* mapped_child = nullptr;
         for (const auto& child_mapping : mapping.child_mappings) {
-            if (!child_mapping.field_id.has_value()) {
+            if (!child_mapping.file_column_unique_id.has_value()) {
                 continue;
             }
             ++mapped_children;
@@ -842,8 +845,8 @@ private:
     static Status build_aggregate_projection(const ColumnMapping& mapping,
                                              FieldProjection* projection) {
         DORIS_CHECK(projection != nullptr);
-        DORIS_CHECK(mapping.field_id.has_value());
-        projection->field_id = *mapping.field_id;
+        DORIS_CHECK(mapping.file_column_unique_id.has_value());
+        projection->column_unique_id = *mapping.file_column_unique_id;
         projection->children.clear();
         projection->project_all_children = true;
         if (mapping.child_mappings.empty()) {
@@ -851,7 +854,7 @@ private:
         }
         projection->project_all_children = false;
         for (const auto& child_mapping : mapping.child_mappings) {
-            if (!child_mapping.field_id.has_value()) {
+            if (!child_mapping.file_column_unique_id.has_value()) {
                 continue;
             }
             FieldProjection child_projection;
@@ -895,15 +898,15 @@ private:
         }
         projected_field->children.clear();
         for (const auto& child_projection : projection.children) {
-            if (child_projection.field_id == -1) {
+            if (child_projection.column_unique_id == -1) {
                 return Status::InvalidArgument("Empty projection path for field {}", field.name);
             }
-            const int32_t child_idx = child_projection.field_id;
+            const int32_t child_idx = child_projection.column_unique_id;
             if (child_idx < 0 || child_idx >= static_cast<int32_t>(field.children.size())) {
                 return Status::InvalidArgument("Invalid projection child index {} for field {}",
                                                child_idx, field.name);
             }
-            if (child_projection.field_id != field.children[child_idx].id) {
+            if (child_projection.column_unique_id != field.children[child_idx].column_unique_id) {
                 return Status::InvalidArgument("Invalid projection path for field {}",
                                                field.children[child_idx].name);
             }

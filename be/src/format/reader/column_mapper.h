@@ -62,14 +62,13 @@ enum TableVirtualColumnType {
 // 单个 table column 到 file column 的映射结果。
 // 这是 table 层和 file 层的核心边界对象。
 struct ColumnMapping {
-    int32_t table_column_id = -1;
+    int32_t table_column_unique_id = -1;
     std::string table_column_name;
     // File-local field id for top-level columns, or child id for nested columns.
-    std::optional<int32_t> field_id;
+    std::optional<int32_t> file_column_unique_id;
     std::string file_column_name;
     DataTypePtr original_file_type;
     std::vector<SchemaField> original_file_children;
-    std::vector<int32_t> file_path;
     DataTypePtr file_type;
     DataTypePtr table_type;
 

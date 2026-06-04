@@ -46,10 +46,10 @@ void collect_table_column_unique_ids(const VExprSPtr& expr,
     }
     if (expr->is_slot_ref()) {
         const auto* slot_ref = assert_cast<const VSlotRef*>(expr.get());
-        column_unique_ids->insert(
-                {slot_ref->column_uniq_id(), TableColumn {.id = slot_ref->column_uniq_id(),
-                                                          .name = slot_ref->column_name(),
-                                                          .type = slot_ref->data_type()}});
+        column_unique_ids->insert({slot_ref->column_uniq_id(),
+                                   TableColumn {.column_unique_id = slot_ref->column_uniq_id(),
+                                                .name = slot_ref->column_name(),
+                                                .type = slot_ref->data_type()}});
     }
     for (const auto& child : expr->children()) {
         collect_table_column_unique_ids(child, column_unique_ids);
