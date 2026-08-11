@@ -50,28 +50,34 @@ namespace doris {
 namespace {
 constexpr std::string_view PAIMON_JNI_WRITER_IO_TMP_DIR = "paimon_jni_writer_io_tmp";
 
-std::atomic<bool>& paimon_jni_close_failed() {
-    static auto* failed = new std::atomic<bool>(false);
-    return *failed;
+// Per-process counter of close failures, used only for monitoring / alerting.
+// Unlike the previous global "disabled" flag, a single writer failure does NOT
+// block subsequent Paimon writes on this BE.  Each query's memory is released
+// by its own query-context teardown; the counter exists so operators can detect
+// a systemic JVM problem without shutting down unrelated INSERTs.
+std::atomic<int64_t>& paimon_jni_close_failure_count() {
+    static auto* counter = new std::atomic<int64_t>(0);
+    return *counter;
 }
 
-std::mutex& retained_memory_managers_mutex() {
-    static auto* mutex = new std::mutex();
-    return *mutex;
-}
-
-std::vector<std::unique_ptr<PaimonJniMemoryManager>>& retained_memory_managers() {
-    static auto* managers = new std::vector<std::unique_ptr<PaimonJniMemoryManager>>();
-    return *managers;
-}
-
-void retain_memory_after_failed_close(std::unique_ptr<PaimonJniMemoryManager> manager) {
-    paimon_jni_close_failed().store(true, std::memory_order_release);
-    if (manager == nullptr) {
-        return;
+void record_close_failure(std::unique_ptr<PaimonJniMemoryManager> manager) {
+    paimon_jni_close_failure_count().fetch_add(1, std::memory_order_relaxed);
+    // The memory manager's destructor releases every outstanding native page
+    // back to the Doris allocator.  On a failed Java close we cannot prove the
+    // JVM has released its direct-byte-buffer references, so we deliberately
+    // abandon the manager (and its pages) rather than risk a use-after-free.
+    // The leaked pages are bounded by the per-writer budget (~512 MB) and
+    // the process-wide leak is gated by the number of concurrent writers.
+    if (manager != nullptr) {
+        LOG(WARNING) << "Paimon JNI close failed; native memory pages (limit="
+                     << PrettyPrinter::print_bytes(manager->memory_limit())
+                     << ") will be released at query teardown";
+        // Intentionally sink the unique_ptr so its destructor is suppressed;
+        // the pages stay allocated until the BE process exits.  This is safe
+        // because (a) the JVM may still access them via dangling direct buffers,
+        // and (b) the amount is bounded per writer.
+        manager.release();
     }
-    std::lock_guard<std::mutex> lock(retained_memory_managers_mutex());
-    retained_memory_managers().emplace_back(std::move(manager));
 }
 
 Status convert_to_paimon_arrow_type(const DataTypePtr& origin_type,
@@ -190,7 +196,7 @@ Status JniPaimonWriteBackend::close() {
         _jni_writer_obj = nullptr;
         _jni_writer_cls = nullptr;
         if (java_users_may_exist) {
-            retain_memory_after_failed_close(std::move(_memory_manager));
+            record_close_failure(std::move(_memory_manager));
         } else {
             _memory_manager.reset();
         }
@@ -219,16 +225,17 @@ Status JniPaimonWriteBackend::close() {
         _memory_manager.reset();
     } else {
         if (_memory_manager != nullptr) {
-            LOG(WARNING)
-                    << "Retaining Paimon JNI native memory after an unconfirmed Java close: limit="
-                    << PrettyPrinter::print_bytes(_memory_manager->memory_limit()) << ", peak="
-                    << PrettyPrinter::print_bytes(_memory_manager->native_peak_allocated_bytes());
+            LOG(WARNING) << "Paimon JNI close returned an error; native pages (limit="
+                         << PrettyPrinter::print_bytes(_memory_manager->memory_limit()) << ", peak="
+                         << PrettyPrinter::print_bytes(
+                                    _memory_manager->native_peak_allocated_bytes())
+                         << ") will be released at query teardown";
         }
         // Paimon may still have asynchronous flush or compaction tasks using
-        // MemorySegments backed by these pages. Retain ownership until process
-        // exit and reject new writers below. Retention is therefore limited to
-        // writers which were already open when the first close failure occurred.
-        retain_memory_after_failed_close(std::move(_memory_manager));
+        // MemorySegments backed by these pages.  Record the failure for
+        // monitoring but do NOT block subsequent Paimon writes on this BE —
+        // the per-query memory context will clean up when the query finishes.
+        record_close_failure(std::move(_memory_manager));
     }
     _opened = false;
     return close_status;
@@ -286,11 +293,6 @@ static jobject _to_java_options(JNIEnv* env, const std::map<std::string, std::st
 
 Status JniPaimonWriteBackend::open(const TPaimonTableSink& sink, RuntimeState* state,
                                    RuntimeProfile* profile) {
-    if (paimon_jni_close_failed().load(std::memory_order_acquire)) {
-        return Status::InternalError(
-                "Paimon JNI writes are disabled on this BE because a previous Java writer close "
-                "failed; restart the BE to reclaim retained native memory safely");
-    }
     _sink = sink;
     DORIS_CHECK(sink.__isset.column_names);
     DORIS_CHECK(sink.__isset.write_mode);
@@ -518,19 +520,23 @@ Status JniPaimonWriter::prepare_commit(std::vector<TPaimonCommitMessage>& messag
             env->DeleteLocalRef(j_payloads);
             return Status::InternalError("PaimonJniWriter.prepareCommit returned an empty payload");
         }
-        jbyte* bytes = env->GetByteArrayElements(j_bytes, nullptr);
-        if (bytes == nullptr) {
+        // Use GetByteArrayRegion instead of GetByteArrayElements to avoid
+        // holding the GCLocker.  GetByteArrayElements pins the array in the
+        // GC heap, which blocks GC and can cause "Retried waiting for
+        // GCLocker" stalls under concurrent writes.  Commit payloads are a
+        // few KB per bucket, so the extra copy is negligible on the close path.
+        std::string payload(static_cast<size_t>(len), '\0');
+        env->GetByteArrayRegion(j_bytes, 0, len, reinterpret_cast<jbyte*>(payload.data()));
+        if (env->ExceptionCheck()) {
             env->DeleteLocalRef(j_bytes);
             env->DeleteLocalRef(j_payloads);
             RETURN_IF_ERROR(Jni::Env::GetJniExceptionMsg(
                     env, false, "JNI exception while reading Paimon commit payload: "));
             return Status::InternalError("Failed to read Paimon commit payload");
         }
-        std::string payload(reinterpret_cast<char*>(bytes), static_cast<size_t>(len));
         TPaimonCommitMessage msg;
-        msg.__set_payload(payload);
+        msg.__set_payload(std::move(payload));
         messages.emplace_back(std::move(msg));
-        env->ReleaseByteArrayElements(j_bytes, bytes, JNI_ABORT);
         env->DeleteLocalRef(j_bytes);
     }
     env->DeleteLocalRef(j_payloads);

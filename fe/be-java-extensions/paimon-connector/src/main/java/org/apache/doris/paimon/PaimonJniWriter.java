@@ -109,12 +109,23 @@ public class PaimonJniWriter {
     private List<CommitMessage> preparedCommitMessages = Collections.emptyList();
     private boolean sdkCloseFailed;
 
+    /**
+     * Fraction of the per-writer memory pool reserved for Arrow's decoded vectors.
+     *
+     * <p>The Arrow allocator creates off-heap direct buffers for arrow vectors, but the JVM
+     * wrapper objects (FieldVector, ArrowBuf, BufferLedger) live on the Java heap and can
+     * exhaust the default 1 GB {@code -Xmx} under concurrent writes.  Capping the allocator
+     * here bounds both the direct-memory footprint and the corresponding Java heap overhead.
+     *
+     * <p>The remaining budget stays with {@link DorisMemorySegmentPool} for Paimon's own
+     * sort / merge write-buffer pages.  A single allocator shared between Arrow and Paimon
+     * would still allow the sum to exceed the advertised per-writer limit, so this split
+     * is an interim measure until cross-JNI reserve/release accounting is available.
+     */
+    private static final double ARROW_ALLOCATOR_BUDGET_FRACTION = 0.25;
+    private static final long ARROW_ALLOCATOR_MIN_BUDGET_BYTES = 16L * 1024 * 1024; // 16 MB
+
     public PaimonJniWriter() {
-        // TODO: Charge ArrowStreamReader's decoded vectors to the same native manager budget
-        // used by DorisMemorySegmentPool. A standalone finite RootAllocator would bound Arrow
-        // itself but would still allow Arrow vectors plus Paimon pages to exceed the advertised
-        // per-writer/query limit, so this requires shared reserve/release accounting across JNI.
-        this.allocator = new RootAllocator(Long.MAX_VALUE);
         this.classLoader = this.getClass().getClassLoader();
     }
 
@@ -336,8 +347,31 @@ public class PaimonJniWriter {
             long nativeMemoryManager) throws Exception {
         int pageSize = coreOptions.pageSize();
         long effectivePoolLimit = Math.min(coreOptions.writeBufferSize(), memoryPoolLimitBytes);
+
+        // Arrow allocator budget: carve out a portion of the per-writer pool so decoded
+        // Arrow vectors cannot push JVM heap/direct-memory past the advertised budget.
+        long arrowBudget = Math.max(
+                (long) (effectivePoolLimit * ARROW_ALLOCATOR_BUDGET_FRACTION),
+                ARROW_ALLOCATOR_MIN_BUDGET_BYTES);
+        long paimonWriteBufferBudget = effectivePoolLimit - arrowBudget;
+        if (paimonWriteBufferBudget < pageSize) {
+            // Degrade gracefully: give everything to Paimon and use only the minimum
+            // Arrow budget.  A single write call transports one Arrow IPC stream of at
+            // most a few MB, so 16 MB is still safe for correctness.
+            paimonWriteBufferBudget = effectivePoolLimit - ARROW_ALLOCATOR_MIN_BUDGET_BYTES;
+            if (paimonWriteBufferBudget < pageSize) {
+                throw new IllegalArgumentException(
+                        "Paimon memory pool is too small to hold at least one page: limit="
+                                + effectivePoolLimit + ", pageSize=" + pageSize);
+            }
+            arrowBudget = ARROW_ALLOCATOR_MIN_BUDGET_BYTES;
+        }
+        this.allocator = new RootAllocator(arrowBudget);
+        LOG.info("Paimon Arrow allocator budget: {} bytes (pool limit: {} bytes, fraction: {})",
+                arrowBudget, effectivePoolLimit, ARROW_ALLOCATOR_BUDGET_FRACTION);
+
         DorisMemorySegmentPool memorySegmentPool =
-                new DorisMemorySegmentPool(effectivePoolLimit, pageSize, nativeMemoryManager);
+                new DorisMemorySegmentPool(paimonWriteBufferBudget, pageSize, nativeMemoryManager);
         MemoryPoolFactory memoryPoolFactory = new MemoryPoolFactory(memorySegmentPool);
         writer.withMemoryPoolFactory(memoryPoolFactory);
         LOG.info("Paimon writer uses Doris-managed memory pool: limit={} bytes, pageSize={}",
