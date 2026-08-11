@@ -121,6 +121,7 @@ void register_function_score(SimpleFunctionFactory& factory);
 void register_function_variant_type(SimpleFunctionFactory& factory);
 void register_function_binary(SimpleFunctionFactory& factory);
 void register_function_soundex(SimpleFunctionFactory& factory);
+void register_function_paimon_bucket(SimpleFunctionFactory& factory);
 
 #if defined(BE_TEST) && !defined(BE_BENCHMARK)
 void register_function_throw_exception(SimpleFunctionFactory& factory);
@@ -357,6 +358,7 @@ public:
             register_function_soundex(instance);
             register_function_json_transform(instance);
             register_function_json_hash(instance);
+            register_function_paimon_bucket(instance);
 #if defined(BE_TEST) && !defined(BE_BENCHMARK)
             register_function_throw_exception(instance);
 #endif

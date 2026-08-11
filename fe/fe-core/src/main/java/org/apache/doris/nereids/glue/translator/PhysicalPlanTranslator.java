@@ -24,6 +24,7 @@ import org.apache.doris.analysis.BoolLiteral;
 import org.apache.doris.analysis.CompoundPredicate;
 import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.FunctionCallExpr;
+import org.apache.doris.analysis.IntLiteral;
 import org.apache.doris.analysis.GroupingInfo;
 import org.apache.doris.analysis.IsNullPredicate;
 import org.apache.doris.analysis.JoinOperator;
@@ -92,6 +93,7 @@ import org.apache.doris.nereids.properties.DistributionSpecHiveTableSinkHashPart
 import org.apache.doris.nereids.properties.DistributionSpecHiveTableSinkUnPartitioned;
 import org.apache.doris.nereids.properties.DistributionSpecMerge;
 import org.apache.doris.nereids.properties.DistributionSpecOlapTableSinkHashPartitioned;
+import org.apache.doris.nereids.properties.DistributionSpecPaimonTableSinkHashPartitioned;
 import org.apache.doris.nereids.properties.DistributionSpecReplicated;
 import org.apache.doris.nereids.properties.DistributionSpecStorageAny;
 import org.apache.doris.nereids.properties.DistributionSpecStorageGather;
@@ -3355,6 +3357,20 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             return new DataPartition(TPartitionType.HIVE_TABLE_SINK_HASH_PARTITIONED, partitionExprs);
         } else if (distributionSpec instanceof DistributionSpecHiveTableSinkUnPartitioned) {
             return new DataPartition(TPartitionType.HIVE_TABLE_SINK_UNPARTITIONED);
+        } else if (distributionSpec instanceof DistributionSpecPaimonTableSinkHashPartitioned) {
+            DistributionSpecPaimonTableSinkHashPartitioned paimonSpec =
+                    (DistributionSpecPaimonTableSinkHashPartitioned) distributionSpec;
+            List<Expr> partitionExprs = Lists.newArrayList();
+            // Build paimon_bucket_id(bucket_key, numBuckets) as the exchange
+            // partition expression so the BE routes rows by the real Paimon bucket id.
+            for (ExprId exprId : paimonSpec.getBucketKeyExprIds()) {
+                if (childOutputIds.contains(exprId)) {
+                    partitionExprs.add(new FunctionCallExpr("paimon_bucket_id",
+                            Lists.newArrayList(context.findSlotRef(exprId),
+                                    new IntLiteral(paimonSpec.getNumBuckets()))));
+                }
+            }
+            return new DataPartition(TPartitionType.HASH_PARTITIONED, partitionExprs);
         } else if (distributionSpec instanceof DistributionSpecMerge) {
             DistributionSpecMerge mergeSpec = (DistributionSpecMerge) distributionSpec;
             Expr operationExpr = context.findSlotRef(mergeSpec.getOperationExprId());
