@@ -40,7 +40,8 @@ import org.apache.doris.common.Version;
 import org.apache.doris.common.util.ExceptionDiagnosticUtils;
 import org.apache.doris.common.util.Util;
 import org.apache.doris.connector.cache.CacheSpec;
-import org.apache.doris.connector.cache.MetaCacheBudgetManager;
+import org.apache.doris.connector.cache.CatalogMetaCache;
+import org.apache.doris.connector.cache.MetaCacheCleanup;
 import org.apache.doris.connector.cache.MetaCacheGovernance;
 import org.apache.doris.datasource.doris.RemoteDorisExternalDatabase;
 import org.apache.doris.datasource.infoschema.ExternalInfoSchemaDatabase;
@@ -75,6 +76,7 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
@@ -170,6 +172,7 @@ public abstract class ExternalCatalog
     private String errorMsg = "";
 
     private boolean objectCreated = false;
+    private transient boolean closed;
     protected TransactionManager transactionManager;
     protected FeMetaCacheEntry<String, NameCacheValue> databaseNames;
     protected FeMetaCacheEntry<String, ExternalDatabase<? extends ExternalTable>> databases;
@@ -334,6 +337,7 @@ public abstract class ExternalCatalog
      * So you have to make sure the client of third system is initialized before any method was called.
      */
     public final synchronized void makeSureInitialized() {
+        Preconditions.checkState(!closed, "Catalog %s has been removed", name);
         if (LOG.isDebugEnabled()) {
             LOG.debug("start to init catalog {}:{}", name, id);
         }
@@ -643,54 +647,41 @@ public abstract class ExternalCatalog
     }
 
     /**
-     * Resets the Catalog state to uninitialized, releases resources held by {@code initLocalObjectsImpl()}
-     * <p>
-     * This method is typically invoked during operations such as {@code CREATE CATALOG}
-     * and {@code MODIFY CATALOG}. It marks the object as uninitialized, clears cached
-     * configurations, and ensures that resources allocated during {@link #initLocalObjectsImpl()}
-     * are properly released via {@link #onClose()}
-     * </p>
-     * <p>
-     * The {@code onClose()} method is responsible for cleaning up resources that were initialized
-     * in {@code initLocalObjectsImpl()}, preventing potential resource leaks.
-     * </p>
+     * Resets local state, retires metadata caches and detaches the current runtime under the catalog monitor.
+     * Physical resource/controller close is registered with the background reclaimer. The next access builds
+     * the replacement from current properties; background work never reads the catalog's live resource fields.
      *
-     * @param invalidCache if {@code true}, the catalog cache will be invalidated
-     *                     and reloaded during the refresh process.
+     * @param invalidCache whether the refresh also invalidates connector caches
      */
     public void resetToUninitialized(boolean invalidCache) {
         resetToUninitialized(invalidCache, false);
     }
 
-    private Runnable resetToUninitialized(boolean invalidCache, boolean deferAccessControllerCleanup) {
-        return resetToUninitialized(invalidCache, deferAccessControllerCleanup, () -> { });
+    private Runnable resetToUninitialized(boolean invalidCache, boolean deferResourceCleanup) {
+        return resetToUninitialized(invalidCache, deferResourceCleanup, () -> { });
     }
 
-    private Runnable resetToUninitialized(boolean invalidCache, boolean deferAccessControllerCleanup,
-            Runnable retireCaches) {
-        Runnable accessControllerCleanup = () -> { };
+    private Runnable resetToUninitialized(boolean invalidCache, boolean deferResourceCleanup,
+            Runnable updateProperties) {
+        Runnable resourceCleanup;
+        synchronized (this) {
+            this.objectCreated = false;
+            this.initialized = false;
+            this.closed = false;
+            resourceCleanup = detachRuntimeAndRetireCaches(updateProperties);
+        }
         try {
-            synchronized (this) {
-                this.objectCreated = false;
-                this.initialized = false;
-                accessControllerCleanup = detachAccessController();
-                try {
-                    closeResourcesQuietly("resetting catalog");
-                } finally {
-                    // Retire core and connector budgets before lazy initialization can publish a new limit.
-                    retireCaches.run();
-                }
-            }
             onRefreshCache(invalidCache);
         } catch (RuntimeException | Error e) {
-            accessControllerCleanup.run();
+            reclaimResources(resourceCleanup);
             throw e;
         }
-        if (!deferAccessControllerCleanup) {
-            accessControllerCleanup.run();
+        Runnable scheduleCleanup = () -> reclaimResources(resourceCleanup);
+        if (!deferResourceCleanup) {
+            scheduleCleanup.run();
             return () -> { };
         }
-        return accessControllerCleanup;
+        return scheduleCleanup;
     }
 
     /**
@@ -927,10 +918,10 @@ public abstract class ExternalCatalog
     }
 
     /**
-     * Apply property changes while atomically detaching the old access controller, but return its potentially
-     * blocking close operation to CatalogMgr so it can run after releasing the global catalog write lock.
+     * Apply properties and detach the old runtime under the catalog monitor. The returned action registers
+     * background resource/controller cleanup after CatalogMgr releases its write lock.
      */
-    public Runnable modifyCatalogPropsWithDeferredAccessControllerCleanup(Map<String, String> props) {
+    public Runnable modifyCatalogPropsWithDeferredResourceCleanup(Map<String, String> props) {
         return resetAfterPropertyUpdate(props, true);
     }
 
@@ -938,40 +929,19 @@ public abstract class ExternalCatalog
         catalogProperty.modifyCatalogProps(props);
     }
 
-    private void invalidateCachesAfterPropertyUpdate(Map<String, String> updatedProps) {
-        ExternalMetaCacheMgr cacheMgr = Env.getCurrentEnv().getExtMetaCacheMgr();
-        if (updatedProps.get(SCHEMA_CACHE_TTL_SECOND) != null
-                || updatedProps.containsKey(MetaCacheBudgetManager.CATALOG_MAX_WEIGHT_PROPERTY)) {
-            cacheMgr.removeCatalog(id);
-            return;
-        }
-        Set<String> removedEngines = Sets.newHashSet();
-        for (String key : updatedProps.keySet()) {
-            if (key == null || !key.startsWith("meta.cache.")) {
-                continue;
-            }
-            String remainder = key.substring("meta.cache.".length());
-            int separator = remainder.indexOf('.');
-            if (separator <= 0) {
-                continue;
-            }
-            String engine = remainder.substring(0, separator);
-            if (cacheMgr.isEngineRegistered(engine) && removedEngines.add(engine)) {
-                cacheMgr.removeCatalogByEngine(id, engine);
-            }
-        }
-        // Scoped removal does not clear other engines or row counts. ALTER may also change the endpoint,
-        // including when a tolerated cache property names an engine that this catalog does not use.
-        cacheMgr.invalidateCatalog(id);
+    private Runnable resetAfterPropertyUpdate(Map<String, String> updatedProps,
+            boolean deferResourceCleanup) {
+        return resetToUninitialized(false, deferResourceCleanup,
+                () -> catalogProperty.modifyCatalogProps(updatedProps));
     }
 
-    private Runnable resetAfterPropertyUpdate(Map<String, String> updatedProps,
-            boolean deferAccessControllerCleanup) {
-        return resetToUninitialized(false, deferAccessControllerCleanup,
-                () -> {
-                    catalogProperty.modifyCatalogProps(updatedProps);
-                    invalidateCachesAfterPropertyUpdate(updatedProps);
-                });
+    private void retireMetadataCaches() {
+        // Remove FE runtime containers before closing the remaining connector-owned cache instances.
+        // Closing only the owner would leave a closed cache in the FE engine's catalog-runtime map.
+        Env.getCurrentEnv().getExtMetaCacheMgr().removeCatalog(id);
+        for (CatalogMetaCache cache : MetaCacheGovernance.catalogCaches(id)) {
+            cache.close();
+        }
     }
 
     public void rollBackCatalogProps(Map<String, String> props) {
@@ -988,37 +958,87 @@ public abstract class ExternalCatalog
 
     @Override
     public final void onClose() {
-        Runnable accessControllerCleanup = detachAccessController();
-        try {
-            closeResourcesQuietly("registered catalog");
-        } finally {
-            accessControllerCleanup.run();
+        Runnable cleanup;
+        synchronized (this) {
+            closed = true;
+            objectCreated = false;
+            initialized = false;
+            cleanup = detachRuntimeAndRetireCaches(() -> { });
         }
+        reclaimResources(cleanup);
+    }
+
+    // Caller holds this catalog's monitor. Child FileIO cleanup must precede connector/context close.
+    private Runnable detachRuntimeAndRetireCaches(Runnable updateProperties) {
+        Runnable accessControllerCleanup = detachAccessController();
+        Runnable detachedResources = detachResources();
+        List<Runnable> cleanupStages = new ArrayList<>();
+        Runnable cleanup = () -> {
+            Throwable failure = null;
+            List<Runnable> stages = new ArrayList<>(cleanupStages);
+            stages.add(detachedResources);
+            stages.add(accessControllerCleanup);
+            for (Runnable stage : stages) {
+                try {
+                    stage.run();
+                } catch (Throwable e) {
+                    if (failure == null) {
+                        failure = e;
+                    } else {
+                        failure.addSuppressed(e);
+                    }
+                }
+            }
+            if (failure != null) {
+                throw new IllegalStateException("Failed to reclaim detached catalog resources", failure);
+            }
+        };
+        try {
+            MetaCacheCleanup.runWithResourceReclaimer((description, child) -> cleanupStages.add(child), () -> {
+                // New connector construction must not see old catalog/group cache limits.
+                retireMetadataCaches();
+                updateProperties.run();
+            });
+        } catch (RuntimeException | Error e) {
+            reclaimResources(cleanup);
+            throw e;
+        }
+        return cleanup;
     }
 
     @Override
     public final void onCreateFailure() {
-        closeResourcesQuietly("unregistered catalog");
-    }
-
-    private void closeResourcesQuietly(String lifecycleStage) {
+        // The unpublished instance cannot be reused by a query. Preserve synchronous creation-failure cleanup.
         try {
             closeResources();
         } catch (Throwable t) {
-            LOG.warn("Failed to close resources for {} {}", lifecycleStage, name, t);
+            LOG.warn("Failed to close resources for unregistered catalog {}", name, t);
         }
     }
 
+    private void reclaimResources(Runnable cleanup) {
+        ExternalResourceReclaimer.getInstance().submit("catalog " + id + " (" + name + ")", cleanup);
+    }
+
+    /** Detach under this catalog's monitor; the returned action must only touch the captured old instances. */
+    protected Runnable detachResources() {
+        ThreadPoolExecutor oldThreadPool = threadPoolWithPreAuth;
+        threadPoolWithPreAuth = null;
+        executionAuthenticator = null;
+        transactionManager = null;
+        return () -> {
+            if (oldThreadPool != null) {
+                ThreadPoolManager.shutdownExecutorService(oldThreadPool);
+            }
+        };
+    }
+
     protected void closeResources() {
-        if (threadPoolWithPreAuth != null) {
-            ThreadPoolManager.shutdownExecutorService(threadPoolWithPreAuth);
+        Runnable cleanup;
+        synchronized (this) {
+            cleanup = detachResources();
         }
-        if (null != executionAuthenticator) {
-            executionAuthenticator = null;
-        }
-        if (null != transactionManager) {
-            transactionManager = null;
-        }
+        cleanup.run();
     }
 
     private Runnable detachAccessController() {
