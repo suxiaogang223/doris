@@ -22,9 +22,9 @@ import org.apache.doris.common.ThreadPoolManager;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
@@ -33,7 +33,6 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /** Owns detached external resources until their close attempt finishes. Never runs close on the submitter. */
@@ -45,6 +44,7 @@ public final class ExternalResourceReclaimer {
 
     private final Executor executor;
     private final ConcurrentMap<Long, Reclamation> pending = new ConcurrentHashMap<>();
+    private final ConcurrentLinkedQueue<Reclamation> waiting = new ConcurrentLinkedQueue<>();
     private final AtomicLong nextId = new AtomicLong();
     private final AtomicLong failures = new AtomicLong();
     private final AtomicLong lastDurationMillis = new AtomicLong();
@@ -89,32 +89,32 @@ public final class ExternalResourceReclaimer {
 
     public void submit(String description, Runnable cleanup) {
         long id = nextId.incrementAndGet();
-        Reclamation task = new Reclamation(description, Objects.requireNonNull(cleanup, "cleanup"));
+        Reclamation task = new Reclamation(id, description, Objects.requireNonNull(cleanup, "cleanup"));
         // Register ownership before dispatch. Rejection leaves the exact same task for the next dispatch.
         pending.put(id, task);
-        tryDispatch(id, task);
+        waiting.add(task);
+        dispatchWaiting();
     }
 
-    private boolean tryDispatch(long id, Reclamation task) {
-        if (!task.dispatched.compareAndSet(false, true)) {
-            return true;
-        }
-        try {
-            executor.execute(() -> reclaimAndDrain(id, task));
-            return true;
-        } catch (RejectedExecutionException e) {
-            task.dispatched.set(false);
-            return false;
+    private void dispatchWaiting() {
+        for (int i = 0; i < WORKERS; i++) {
+            Reclamation task = waiting.poll();
+            if (task == null) {
+                return;
+            }
+            try {
+                executor.execute(() -> reclaimAndDrain(task));
+            } catch (RejectedExecutionException e) {
+                // No caller-runs fallback. The same registered task remains owned and can be retried.
+                waiting.add(task);
+                return;
+            }
         }
     }
 
     void dispatchPending() {
         try {
-            for (Map.Entry<Long, Reclamation> entry : pending.entrySet()) {
-                if (!tryDispatch(entry.getKey(), entry.getValue())) {
-                    break;
-                }
-            }
+            dispatchWaiting();
             long oldest = oldestAgeMillis();
             long now = System.currentTimeMillis();
             long lastWarning = lastWarningMillis.get();
@@ -138,22 +138,10 @@ public final class ExternalResourceReclaimer {
         }
     }
 
-    private void reclaimAndDrain(long id, Reclamation task) {
-        while (true) {
-            reclaim(id, task);
-            Map.Entry<Long, Reclamation> next = null;
-            for (Map.Entry<Long, Reclamation> entry : pending.entrySet()) {
-                if (entry.getValue().dispatched.compareAndSet(false, true)) {
-                    next = entry;
-                    break;
-                }
-            }
-            if (next == null) {
-                return;
-            }
-            // Keep draining on this background worker. Short closes should not wait for the periodic retry.
-            id = next.getKey();
-            task = next.getValue();
+    private void reclaimAndDrain(Reclamation first) {
+        // Poll each waiting record once, rather than rescanning all pending records after every short close.
+        for (Reclamation task = first; task != null; task = waiting.poll()) {
+            reclaim(task.id, task);
         }
     }
 
@@ -207,13 +195,14 @@ public final class ExternalResourceReclaimer {
     }
 
     private static final class Reclamation {
+        private final long id;
         private final String description;
         private final Runnable cleanup;
         private final long createdNanos = System.nanoTime();
         private final ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
-        private final AtomicBoolean dispatched = new AtomicBoolean();
 
-        private Reclamation(String description, Runnable cleanup) {
+        private Reclamation(long id, String description, Runnable cleanup) {
+            this.id = id;
             this.description = description;
             this.cleanup = cleanup;
         }

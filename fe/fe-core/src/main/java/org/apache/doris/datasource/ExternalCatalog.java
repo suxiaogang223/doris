@@ -40,7 +40,6 @@ import org.apache.doris.common.Version;
 import org.apache.doris.common.util.ExceptionDiagnosticUtils;
 import org.apache.doris.common.util.Util;
 import org.apache.doris.connector.cache.CacheSpec;
-import org.apache.doris.connector.cache.CatalogMetaCache;
 import org.apache.doris.connector.cache.MetaCacheCleanup;
 import org.apache.doris.connector.cache.MetaCacheGovernance;
 import org.apache.doris.datasource.doris.RemoteDorisExternalDatabase;
@@ -936,12 +935,8 @@ public abstract class ExternalCatalog
     }
 
     private void retireMetadataCaches() {
-        // Remove FE runtime containers before closing the remaining connector-owned cache instances.
-        // Closing only the owner would leave a closed cache in the FE engine's catalog-runtime map.
+        // Remove this Env's FE runtime containers, rather than closing owners found by global catalog ID.
         Env.getCurrentEnv().getExtMetaCacheMgr().removeCatalog(id);
-        for (CatalogMetaCache cache : MetaCacheGovernance.catalogCaches(id)) {
-            cache.close();
-        }
     }
 
     public void rollBackCatalogProps(Map<String, String> props) {
@@ -971,6 +966,7 @@ public abstract class ExternalCatalog
     // Caller holds this catalog's monitor. Child FileIO cleanup must precede connector/context close.
     private Runnable detachRuntimeAndRetireCaches(Runnable updateProperties) {
         Runnable accessControllerCleanup = detachAccessController();
+        Runnable retireConnectorCaches = captureConnectorCacheRetirement();
         Runnable detachedResources = detachResources();
         List<Runnable> cleanupStages = new ArrayList<>();
         Runnable cleanup = () -> {
@@ -984,7 +980,7 @@ public abstract class ExternalCatalog
                 } catch (Throwable e) {
                     if (failure == null) {
                         failure = e;
-                    } else {
+                    } else if (failure != e) {
                         failure.addSuppressed(e);
                     }
                 }
@@ -996,6 +992,7 @@ public abstract class ExternalCatalog
         try {
             MetaCacheCleanup.runWithResourceReclaimer((description, child) -> cleanupStages.add(child), () -> {
                 // New connector construction must not see old catalog/group cache limits.
+                retireConnectorCaches.run();
                 retireMetadataCaches();
                 updateProperties.run();
             });
@@ -1018,6 +1015,11 @@ public abstract class ExternalCatalog
 
     private void reclaimResources(Runnable cleanup) {
         ExternalResourceReclaimer.getInstance().submit("catalog " + id + " (" + name + ")", cleanup);
+    }
+
+    /** Capture before detaching fields; the default catalog has no connector-owned caches. */
+    protected Runnable captureConnectorCacheRetirement() {
+        return () -> { };
     }
 
     /** Detach under this catalog's monitor; the returned action must only touch the captured old instances. */

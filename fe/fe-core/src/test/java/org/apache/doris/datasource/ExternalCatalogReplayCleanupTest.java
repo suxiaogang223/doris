@@ -22,6 +22,7 @@ import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.connector.DefaultConnectorContext;
 import org.apache.doris.connector.cache.CacheSpec;
 import org.apache.doris.connector.cache.CatalogMetaCache;
+import org.apache.doris.connector.cache.ConnectorCacheOwner;
 import org.apache.doris.connector.cache.MetaCache;
 import org.apache.doris.connector.cache.MetaCacheCleanup;
 import org.apache.doris.connector.cache.MetaCacheDefinition;
@@ -80,7 +81,10 @@ public class ExternalCatalogReplayCleanupTest extends TestWithFeService {
             contextClosed.countDown();
             return null;
         }).when(context).close();
-        CatalogMetaCache owner = CatalogMetaCache.managed(id, "cleanup-test", Collections.emptyMap());
+        ConnectorCacheOwner cacheOwner = new ConnectorCacheOwner();
+        catalog.cacheRetirement = cacheOwner::retire;
+        CatalogMetaCache owner = cacheOwner.create(
+                () -> CatalogMetaCache.managed(id, "cleanup-test", Collections.emptyMap()));
         MetaCache<String, String> entry = owner.create(MetaCacheDefinition.<String, String>builder("child",
                         CacheSpec.of(true, -1L, 100L), key -> ScopePath.catalog())
                 .removalListener((key, value, reason) -> MetaCacheCleanup.reclaimResource("old FileIO", () -> {
@@ -113,6 +117,29 @@ public class ExternalCatalogReplayCleanupTest extends TestWithFeService {
             replayer.shutdownNow();
             Assertions.assertTrue(replayer.awaitTermination(10L, TimeUnit.SECONDS));
             owner.close();
+        }
+    }
+
+    @Test
+    void coldCatalogReplayDoesNotRetireAnotherEnvsMatchingCatalogId() throws Exception {
+        long id = 72805L;
+        ConnectorCacheOwner servingOwner = new ConnectorCacheOwner();
+        try (CatalogMetaCache servingCache = servingOwner.create(
+                () -> CatalogMetaCache.managed(id, "cleanup-test", Collections.emptyMap()))) {
+            MetaCache<String, String> entry = servingCache.create(MetaCacheDefinition.<String, String>builder(
+                    "serving", CacheSpec.of(true, -1L, 100L), key -> ScopePath.catalog()).build());
+            entry.put("key", "serving value");
+            CatalogMgr checkpointMgr = new CatalogMgr();
+            HarnessCatalog checkpointCatalog = new HarnessCatalog(id, "checkpoint_copy", null, null, null);
+            register(checkpointMgr, checkpointCatalog);
+            CatalogLog log = new CatalogLog();
+            log.setCatalogId(id);
+            log.setNewProps(Collections.singletonMap("endpoint", "checkpoint-source"));
+            checkpointMgr.replayAlterCatalogProps(log, Collections.emptyMap(), true);
+            Assertions.assertEquals("serving value", entry.getIfPresent("key"));
+            Assertions.assertTrue(MetaCacheGovernance.catalogCaches(id).contains(servingCache));
+        } finally {
+            servingOwner.retire();
         }
     }
 
@@ -150,7 +177,10 @@ public class ExternalCatalogReplayCleanupTest extends TestWithFeService {
         log.setNewProps(changes);
         log.setNewCatalogName("renamed_" + operation);
         catalog.tryModifyCatalogProps(Collections.singletonMap("meta.cache.max-weight", "4KB"));
-        CatalogMetaCache oldCache = CatalogMetaCache.managed(id, "cleanup-test", catalog.getProperties());
+        ConnectorCacheOwner cacheOwner = new ConnectorCacheOwner();
+        catalog.cacheRetirement = cacheOwner::retire;
+        CatalogMetaCache oldCache = cacheOwner.create(
+                () -> CatalogMetaCache.managed(id, "cleanup-test", catalog.getProperties()));
         createWeightedEntry(oldCache).put("old", "metadata");
         CatalogMetaCache replacementCache = null;
         ExecutorService replayer = Executors.newSingleThreadExecutor();
@@ -235,12 +265,18 @@ public class ExternalCatalogReplayCleanupTest extends TestWithFeService {
     private static final class HarnessCatalog extends PluginDrivenExternalCatalog {
         private final Connector replacement;
         private final DefaultConnectorContext replacementContext;
+        private Runnable cacheRetirement = () -> { };
 
         private HarnessCatalog(long id, String name, Connector initial, Connector replacement,
                 DefaultConnectorContext replacementContext) {
             super(id, name, null, new HashMap<>(), "", initial);
             this.replacement = replacement;
             this.replacementContext = replacementContext;
+        }
+
+        @Override
+        protected Runnable captureConnectorCacheRetirement() {
+            return cacheRetirement;
         }
 
         @Override

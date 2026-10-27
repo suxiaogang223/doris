@@ -20,8 +20,8 @@ package org.apache.doris.connector.iceberg;
 import org.apache.doris.connector.cache.CacheSpec;
 import org.apache.doris.connector.cache.CatalogMetaCache;
 import org.apache.doris.connector.cache.JvmSizeUtils;
-import org.apache.doris.connector.cache.MetaCacheCleanup;
 import org.apache.doris.connector.cache.MetaCache;
+import org.apache.doris.connector.cache.MetaCacheCleanup;
 import org.apache.doris.connector.cache.MetaCacheDefinition;
 import org.apache.doris.connector.cache.MetaCacheSizeEstimate;
 import org.apache.doris.connector.cache.MetaCacheSizeEstimator;
@@ -340,7 +340,7 @@ final class IcebergTableCache {
                     Thread thread = Thread.currentThread();
                     ClassLoader previous = thread.getContextClassLoader();
                     try {
-                        thread.setContextClassLoader(table.getClass().getClassLoader());
+                        thread.setContextClassLoader(IcebergTableCache.class.getClassLoader());
                         cleanup.run();
                     } finally {
                         thread.setContextClassLoader(previous);

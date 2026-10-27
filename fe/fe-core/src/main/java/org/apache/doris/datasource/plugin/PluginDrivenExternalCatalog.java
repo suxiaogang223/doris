@@ -126,7 +126,7 @@ public class PluginDrivenExternalCatalog extends ExternalCatalog {
     // The engine-owned context shared by the connector (and any sibling it builds via createSiblingConnector).
     // Held so the catalog can close the context's cached engine FileSystem (DefaultConnectorContext.getFileSystem)
     // on teardown -- connectors only borrow that FS and must not close it. Null until the real connector is built
-    // (the lightweight CatalogFactory context is not tracked here; its FS is never built).
+    // The CatalogFactory validation context is retained too, so its caches have the same ownership boundary.
     private transient volatile DefaultConnectorContext connectorContext;
 
     // The displayed engine name, resolved from the provider on first use (see getDisplayEngineName).
@@ -151,6 +151,12 @@ public class PluginDrivenExternalCatalog extends ExternalCatalog {
         super(catalogId, name, InitCatalogLog.Type.PLUGIN, comment);
         this.catalogProperty = new CatalogProperty(resource, props);
         this.connector = connector;
+    }
+
+    public PluginDrivenExternalCatalog(long catalogId, String name, String resource,
+            Map<String, String> props, String comment, Connector connector, DefaultConnectorContext context) {
+        this(catalogId, name, resource, props, comment, connector);
+        this.connectorContext = context;
     }
 
     @Override
@@ -218,8 +224,7 @@ public class PluginDrivenExternalCatalog extends ExternalCatalog {
         this.connectorContext = context;
         // The standalone entry point, same as CatalogFactory uses: this is the second door onto a catalog (the
         // lazy build after image deserialization), and both doors must agree on what may become a catalog.
-        return ConnectorFactory.createStandaloneCatalogConnector(
-                catalogType, catalogProperty.getProperties(), context);
+        return context.createCatalogConnector(catalogType, catalogProperty.getProperties());
     }
 
     @Override
@@ -1759,6 +1764,12 @@ public class PluginDrivenExternalCatalog extends ExternalCatalog {
     }
 
     @Override
+    protected Runnable captureConnectorCacheRetirement() {
+        DefaultConnectorContext contextToRetire = connectorContext;
+        return contextToRetire == null ? () -> { } : contextToRetire::retireMetadataCaches;
+    }
+
+    @Override
     protected Runnable detachResources() {
         Runnable commonCleanup = super.detachResources();
         Connector connectorToClose = connector;
@@ -1793,7 +1804,7 @@ public class PluginDrivenExternalCatalog extends ExternalCatalog {
                 } catch (Throwable e) {
                     if (failure == null) {
                         failure = e;
-                    } else {
+                    } else if (failure != e) {
                         failure.addSuppressed(e);
                     }
                 } finally {
@@ -1807,7 +1818,7 @@ public class PluginDrivenExternalCatalog extends ExternalCatalog {
                 } catch (Throwable e) {
                     if (failure == null) {
                         failure = e;
-                    } else {
+                    } else if (failure != e) {
                         failure.addSuppressed(e);
                     }
                 }

@@ -2,7 +2,18 @@
 
 基线：`origin/master`，`b68d1d50522c9f08b53b376dd684a34270c4e608`。日期：2026-10-27。
 
-这是供 review 的代码草稿。按要求未编译，未运行 Checkstyle、单测、回归测试或集群验证。
+这是供 review 的代码草稿。已按仓库 code-review 指南完成逐项静态审查，涉及的三个模块已通过 Checkstyle。按要求仍未编译、未运行单测、回归测试或集群验证。
+
+## 本轮审查发现并修正的问题
+
+| 优先级 | 问题与触发路径 | 修正 |
+| --- | --- | --- |
+| P1 | checkpoint 与服务 Env 可以具有相同 Catalog ID。原先 `retireMetadataCaches()` 从进程全局 `MetaCacheGovernance.catalogCaches(id)` 找旧 owner，checkpoint 回放 ALTER/DROP 时会关闭服务 Env 的缓存 | 新增 `ConnectorCacheOwner`，由每个 context 跟踪自己构造出的缓存实例；主 connector 和之后创建的 sibling 共用同一个 owner。FE 缓存只从当前 Env 的 cache manager 注销，不再按全局 ID 找清理目标 |
+| P2 | worker 每完成一个任务就重扫 pending 表领取下一项；积压大时会重复扫描大量记录 | 待处理队列负责领取任务，pending 表只保留所有权、指标和告警用途；调度拒绝时将原记录重新放回队列 |
+| P2 | Iceberg 清理使用 `table.getClass().getClassLoader()`，但 Table 实现类可能来自父加载器，与插件自己的辅助类加载器不同 | 使用 `IcebergTableCache` 所在插件代码的加载器执行清理，并在退出时恢复 |
+| P2 | lazy 初始化的 provider 构造失败后会用新 context 重试；失败尝试中已经创建的缓存和文件系统不能遗留 | 根 connector 构造失败时注销该 context 的缓存 owner，并登记其文件系统清理；保持原始构造异常 |
+
+新增测试代码覆盖同 ID 的 owner 隔离、冷 Catalog 副本回放不关闭服务缓存、退休期间才完成的注册被拒绝、延迟创建的 sibling 被同一 context 跟踪，以及根构造失败不留下缓存注册。这些测试尚未执行，修正结论来自调用链审查，不是运行验证。
 
 ## 这一版改了什么
 
@@ -77,7 +88,7 @@ REFRESH / 外表 DDL 的缓存失效
 
 先登记资源归属，再尝试调度。工作线程满时保留记录，后台调度器重试；不阻塞入队，不使用 CallerRunsPolicy，不在回放线程等待 Future。工作线程完成一个任务后继续处理待回收记录，避免短任务都等待定时轮询。
 
-同一批退休资源的依赖清理按顺序执行；独立任务可以并行。关闭失败会记录异常和失败数，并继续尝试该批剩余独立阶段；不会自动重试一个可能已执行一半的 close。
+同一批退休资源的依赖清理按顺序执行；独立任务可以并行。context 的缓存 owner 先标记退休并取出固定实例，再在 owner 自身的短锁外关闭这些缓存；与退休并发的晚注册会被拒绝，并移除该次失败的全局统计注册。关闭失败会记录异常和失败数，并继续尝试该批剩余独立阶段；不会自动重试一个可能已执行一半的 close。
 
 插件关闭时切换并恢复对应类加载器；永久后台线程使用 FE 类加载器，避免继承首次提交者的插件类加载器。
 
@@ -111,11 +122,11 @@ REFRESH / 外表 DDL 的缓存失效
 | --- | --- |
 | 目标和证据 | 已拆分资源摘除与关闭；测试代码覆盖关键顺序，尚无运行结果 |
 | 改动范围 | FE Catalog 生命周期、资源回收器、Iceberg FileIO 释放及相应测试；无 BE 改动 |
-| 并发和锁 | 旧字段在 Catalog monitor 内摘除；全局锁内不执行这些资源的物理 close；初始化和同步扫描仍是限制 |
-| 生命周期和静态初始化 | 回收器按需单例；登记表持有旧实例直到关闭尝试结束；不把当前 Catalog 对象交给后台调用 onClose |
+| 并发和锁 | 旧字段在 Catalog monitor 内摘除；owner 的注册、快照由自己的 monitor 保护，关闭快照前已释放该 monitor；后台无按名称回查；未发现新增锁顺序倒置。初始化和同步扫描仍是限制 |
+| 生命周期和静态初始化 | 回收器按需单例；context 单独跟踪缓存 owner，隔离相同 ID 的不同 Env；晚注册被拒绝；失败构造清理自己的 context；登记表持有旧实例到关闭尝试结束 |
 | 新配置 | 无新增配置，worker 数量暂为固定值 |
 | 兼容性 | 不修改日志、Image、Thrift、Protobuf 或 connector SPI；进程重启不恢复本地回收队列 |
-| 并行路径 | Master 本地执行和 FE 回放共用拆分；刷新沿用缓存统一的 FileIO 释放入口 |
+| 并行路径 | Master 本地执行和 FE 回放共用拆分；覆盖初次构造、lazy 重建、sibling、失败构造和 checkpoint 副本；刷新沿用统一 FileIO 释放入口 |
 | 条件和异常分支 | 保留冷资源无实例、调度拒绝、close 抛异常的处理；清理异常有日志 |
 | 测试覆盖 | 新增并发和所有权测试，调整原先依赖同步关闭的断言；暂未执行 |
 | 测试结果文件 | 没有新增或手写回归结果文件 |
@@ -123,5 +134,19 @@ REFRESH / 外表 DDL 的缓存失效
 | 持久化和主从切换 | 元数据日志顺序和格式保留；后台只负责当前进程的资源回收 |
 | 数据写入与事务 | 不增加或重放远端业务写入；已有 connector 的事务/查询终止规则未扩展 |
 | FE/BE 参数传递 | 无新增跨端参数 |
-| 性能和资源开销 | close 已移出回放；同步扫描和待回收资源实际占用仍需后续测量与治理 |
-| 其他风险 | 尚未运行编译和测试；上述剩余边界需继续 review，不能作为完整非阻塞保证 |
+| 性能和资源开销 | worker 用队列领取任务，不再逐任务重扫 pending；同步扫描仍保留，待回收资源没有硬容量/字节上限，仍是明确的资源积压风险 |
+| 其他风险 | 尚未运行编译和测试；完整非阻塞保证仍未达到，初始化锁、扫描、积压上限及统一借用协议是剩余工作 |
+
+## Checkstyle 结果
+
+在 `fe/` 目录执行，仅运行样式检查：
+
+```bash
+mvn checkstyle:check \
+  -pl fe-core,fe-connector/fe-connector-cache,fe-connector/fe-connector-iceberg \
+  -Dmaven.build.cache.enabled=false
+```
+
+2026-10-27 最终执行结果：`BUILD SUCCESS`。`fe-connector-cache`、`fe-connector-iceberg` 和 `fe-core` 均为 `0 Checkstyle violations`，包括测试源码的样式检查。过程中修正了 import 排序；没有执行编译或测试。
+
+完整日志：`/tmp/external-catalog-cleanup-checkstyle-final.log`。
